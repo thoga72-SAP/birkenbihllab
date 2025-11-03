@@ -1,0 +1,19 @@
+{
+  "name": "birkenbihllab",
+  "version": "1.0.0",
+  "description": "Birkenbihllab Trainer (EN → DE) – Client + Server Deployment",
+  "private": true,
+  "scripts": {
+    "install": "npm install --prefix server && npm install --prefix client",
+    "build": "npm run build --prefix client",
+    "start": "npm start --prefix server",
+    "dev": "concurrently \"npm run dev --prefix server\" \"npm run dev --prefix client\""
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
