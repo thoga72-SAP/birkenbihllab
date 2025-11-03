@@ -28,13 +28,13 @@ app.post('/api/translate', async (req, res) => {
     if (!key) return res.status(500).json({ error: 'DEEPL_KEY missing' });
 
     // kurzer, restriktiver Prompt für 1:1-Vorschlag
-    const text = `Übersetze möglichst wortwörtlich ins Deutsche (max. 3 Wörter). Phrase: "${phraseText}". Kontext: "${contextText}"`;
-
+    const text = phraseText || contextText || '';
     const params = new URLSearchParams({
-      auth_key: key,
-      text,
-      target_lang: 'DE',
-    });
+  auth_key: key,
+  text,
+  target_lang: 'DE'
+});
+
 
     const r = await fetch(url, { method: 'POST', body: params });
     const data = await r.json();
