@@ -18,7 +18,7 @@ const COMMON_CAP_WORDS = new Set([
   "they","we","you","i"
 ]);
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3001";
+const API_BASE = ""; // gleiche Origin wie das Frontend
 
 export default function App() {
   const [inputText, setInputText] = useState(
