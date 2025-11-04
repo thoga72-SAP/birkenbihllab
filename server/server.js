@@ -19,20 +19,24 @@ app.use(express.json());
 app.get('/health', (req, res) => res.send('ok'));
 
 // --- DeepL: wortwörtliche Einzel-/Phrasen-Übersetzung ---
-app.post('/api/translate', async (req, res) => {
-  try {
+app.post('/api/translate', async (req,res)=>{
+  try{
     const { phraseText, contextText } = req.body || {};
     const key = process.env.DEEPL_KEY;
     const url = process.env.DEEPL_URL || 'https://api-free.deepl.com/v2/translate';
+    if(!key) return res.status(500).json({error:'DEEPL_KEY missing'});
 
-    if (!key) return res.status(500).json({ error: 'DEEPL_KEY missing' });
-
-    // kurzer, restriktiver Prompt für 1:1-Vorschlag
+    // Wichtig: nur das eigentliche Wort/Phrase an DeepL senden
     const text = phraseText || contextText || '';
-    const params = new URLSearchParams({
-  auth_key: key,
-  text,
-  target_lang: 'DE'
+
+    const params = new URLSearchParams({ auth_key: key, text, target_lang: 'DE' });
+    const r = await fetch(url, { method:'POST', body: params });
+    const data = await r.json();
+    res.json({ translatedText: data?.translations?.[0]?.text || '' });
+  }catch(e){
+    console.error(e);
+    res.status(500).json({error:'translate failed'});
+  }
 });
 
 
