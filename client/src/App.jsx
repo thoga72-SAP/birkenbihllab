@@ -18,7 +18,83 @@ const COMMON_CAP_WORDS = new Set([
   "they","we","you","i"
 ]);
 
-const API_BASE = ""; // gleiche Origin wie das Frontend
+/** gleiche Origin wie das Frontend (Render) */
+const API_BASE = "";
+
+/* ---------------- Hilfsfunktionen ---------------- */
+const isPunctuation = (s) => !!s && /^[^A-Za-zÄÖÜäöüß]+$/.test(s);
+
+function isLikelyName(str) {
+  if (!str || isPunctuation(str) || !/[A-Za-zÄÖÜäöüß]/.test(str)) return false;
+  if (str === str.toUpperCase() && str.length > 1) return true; // WHO, UN
+  const cap = str[0] === str[0].toUpperCase() && str.slice(1) === str.slice(1).toLowerCase();
+  if (cap) return !COMMON_CAP_WORDS.has(str.toLowerCase());
+  return false;
+}
+
+function guessRole(tokens, idx) {
+  const prev = tokens[idx - 1]?.text?.toLowerCase() || "";
+  const prev2 = tokens[idx - 2]?.text?.toLowerCase() || "";
+  const next = tokens[idx + 1]?.text?.toLowerCase() || "";
+
+  const articleLike = new Set(["a", "an", "the", "this", "that", "these", "those"]);
+  const modalLike = new Set(["will","can","could","should","would","may","might","shall","must"]);
+
+  if (articleLike.has(prev)) return "noun";
+  if (prev === "to") return "verb";
+  if (prev === "and" && articleLike.has(next)) return "verb";
+  if (modalLike.has(prev) || modalLike.has(prev2)) return "verb";
+  return "unknown";
+}
+
+/** Optionen sortieren, “bevorzugt”-Spam dämpfen, aber ALLES behalten */
+function rankAndKeepAllMeanings(engWord, rawOptions, roleGuess) {
+  const lowerEng = (engWord || "").toLowerCase();
+  const looksVerb = (g) => /\b\w+(en|ern|eln)\b/.test((g||"").trim());
+  const looksNoun = (g) => {
+    const f = (g || "").trim().split(/\s+/)[0] || "";
+    return f && f[0] === f[0].toUpperCase();
+  };
+  const overused = new Set(["bevorzugt", "bevorzugen"]);
+  const isPreferish = /^(prefer|prefers|preferred|preference|favor)$/i.test(lowerEng);
+
+  const scored = (rawOptions || []).map(opt => {
+    const cleaned = String(opt || "").trim();
+    if (!cleaned) return null;
+    let score = 0;
+    const wc = cleaned.split(/\s+/).length;
+    if (wc <= 3) score += 1;
+    if (wc === 1) score += 1;
+    if (roleGuess === "verb" && looksVerb(cleaned)) score += 2;
+    if (roleGuess === "noun" && looksNoun(cleaned)) score += 2;
+    if (overused.has(cleaned.toLowerCase()) && !isPreferish) score -= 3;
+    return { opt: cleaned, score };
+  }).filter(Boolean);
+
+  scored.sort((a, b) => (b.score - a.score) || a.opt.localeCompare(b.opt, "de"));
+  const seen = new Set(); const result = [];
+  for (const { opt } of scored) { const k = opt.toLowerCase(); if (seen.has(k)) continue; seen.add(k); result.push(opt); }
+  return result;
+}
+
+/** DeepL-Antwort auf “kurzes, brauchbares Stück” eindampfen */
+function cleanDeepL(s = "") {
+  let t = String(s).trim();
+
+  // Fälle ausschließen, in denen die Prompt-Anweisung gespiegelt wurde
+  if (/Übersetze möglichst wortwörtlich/i.test(t)) return "";
+
+  // nur den ersten sinnvollen Satzteil nehmen
+  t = t.split(/[\r\n.;!?]/)[0].trim();
+
+  // nicht zu lang
+  const wc = t.split(/\s+/).filter(Boolean).length;
+  if (!t || wc > 4 || t.length > 40) return "";
+
+  return t;
+}
+
+/* ================================================== */
 
 export default function App() {
   const [inputText, setInputText] = useState(
@@ -40,59 +116,6 @@ and to learn some words and culture in the process.`
   const [hoverInfo, setHoverInfo] = useState({ lineIdx: null, tokenIdx: null, overTooltip: false });
   const hoverTimerRef = useRef(null);
   const tokenRefs = useRef({});
-
-  /* -------- Hilfen -------- */
-  const isPunctuation = (s) => !!s && /^[^A-Za-zÄÖÜäöüß]+$/.test(s);
-
-  function isLikelyName(str) {
-    if (!str || isPunctuation(str) || !/[A-Za-zÄÖÜäöüß]/.test(str)) return false;
-    if (str === str.toUpperCase() && str.length > 1) return true; // WHO, UN
-    const cap = str[0] === str[0].toUpperCase() && str.slice(1) === str.slice(1).toLowerCase();
-    if (cap) return !COMMON_CAP_WORDS.has(str.toLowerCase());
-    return false;
-  }
-
-  function guessRole(tokens, idx) {
-    const prev = tokens[idx - 1]?.text?.toLowerCase() || "";
-    const prev2 = tokens[idx - 2]?.text?.toLowerCase() || "";
-    const next = tokens[idx + 1]?.text?.toLowerCase() || "";
-    const articleLike = new Set(["a", "an", "the", "this", "that", "these", "those"]);
-    const modalLike = new Set(["will","can","could","should","would","may","might","shall","must"]);
-    if (articleLike.has(prev)) return "noun";
-    if (prev === "to") return "verb";
-    if (prev === "and" && articleLike.has(next)) return "verb";
-    if (modalLike.has(prev) || modalLike.has(prev2)) return "verb";
-    return "unknown";
-  }
-
-  function rankAndKeepAllMeanings(engWord, rawOptions, roleGuess) {
-    const lowerEng = (engWord || "").toLowerCase();
-    const looksVerb = (g) => /\b\w+(en|ern|eln)\b/.test((g||"").trim());
-    const looksNoun = (g) => {
-      const f = (g || "").trim().split(/\s+/)[0] || "";
-      return f && f[0] === f[0].toUpperCase();
-    };
-    const overused = new Set(["bevorzugt", "bevorzugen"]);
-    const isPreferish = /^(prefer|prefers|preferred|preference|favor)$/i.test(lowerEng);
-
-    const scored = (rawOptions || []).map(opt => {
-      const cleaned = String(opt || "").trim();
-      if (!cleaned) return null;
-      let score = 0;
-      const wc = cleaned.split(/\s+/).length;
-      if (wc <= 3) score += 1;
-      if (wc === 1) score += 1;
-      if (roleGuess === "verb" && looksVerb(cleaned)) score += 2;
-      if (roleGuess === "noun" && looksNoun(cleaned)) score += 2;
-      if (overused.has(cleaned.toLowerCase()) && !isPreferish) score -= 3;
-      return { opt: cleaned, score };
-    }).filter(Boolean);
-
-    scored.sort((a, b) => (b.score - a.score) || a.opt.localeCompare(b.opt, "de"));
-    const seen = new Set(); const result = [];
-    for (const { opt } of scored) { const k = opt.toLowerCase(); if (seen.has(k)) continue; seen.add(k); result.push(opt); }
-    return result;
-  }
 
   const tokenize = (s) => (s.match(/(\w+|'\w+|[^\s\w]+)/g) || []).map(t => ({ text: t }));
 
@@ -123,6 +146,49 @@ and to learn some words and culture in the process.`
       }
     })();
   }, []);
+
+  /* -------- DeepL-Einzelwort nachladen (beim Hover) -------- */
+  async function fetchDeepLForToken(lineIdx, tokenIdx) {
+    try {
+      const line = lines[lineIdx];
+      if (!line) return;
+
+      const token = line.tokens[tokenIdx]?.text;
+      if (!token || isPunctuation(token) || line.tokenMeta[tokenIdx]?.isName) return;
+
+      const contextText = line.tokens.map(t => t.text).join(" ");
+
+      const r = await fetch(`${API_BASE}/api/translate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phraseText: token, contextText })
+      });
+      if (!r.ok) return;
+
+      const data = await r.json();
+      const deepl = cleanDeepL(data?.translatedText || "");
+      if (!deepl) return;
+
+      setLines(prev => {
+        const up = [...prev];
+        const l = { ...up[lineIdx] };
+        const opts = l.translationOptions.map(a => (a ? [...a] : []));
+        const tr  = [...l.translations];
+
+        const already = (opts[tokenIdx] || []).some(o => o.toLowerCase() === deepl.toLowerCase());
+        if (!already) (opts[tokenIdx] ||= []).push(deepl);
+
+        if (!tr[tokenIdx]) tr[tokenIdx] = deepl;
+
+        l.translationOptions = opts;
+        l.translations = tr;
+        up[lineIdx] = l;
+        return up;
+      });
+    } catch (e) {
+      console.warn("DeepL word fetch failed:", e);
+    }
+  }
 
   /* -------- Aufbereiten (mit DeepL-Kontext) -------- */
   async function handlePrepare() {
@@ -166,10 +232,11 @@ and to learn some words and culture in the process.`
         const role = guessRole(tokens, idx);
         const ranked = rankAndKeepAllMeanings(w, mergedRaw, role);
 
-        // DeepL-Kandidat in der Nähe suchen (einfacher Heuristik-Fenster)
+        // DeepL-Kandidat in der Nähe suchen (einfaches Fenster)
         let deepLCandidate = "";
         if (contextDE.length) {
-          const check = [idx - 1, idx, idx + 1, idx + 2].filter(i => i >= 0 && i < contextDE.length).map(i => contextDE[i]);
+          const indices = [idx - 1, idx, idx + 1, idx + 2].filter(i => i >= 0 && i < contextDE.length);
+          const check = indices.map(i => contextDE[i]);
           deepLCandidate = check.find(x => x && !/^(der|die|das|den|dem|des|ein|eine|einen|einem|einer|eines)$/i.test(x)) || "";
         }
 
@@ -220,7 +287,7 @@ and to learn some words and culture in the process.`
     }
   }
 
-  /* -------- Tooltip -------- */
+  /* ---------------- Tooltip-Logik ---------------- */
   function scheduleHide() {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
     hoverTimerRef.current = setTimeout(() => setHoverInfo({ lineIdx: null, tokenIdx: null, overTooltip: false }), 200);
@@ -229,7 +296,25 @@ and to learn some words and culture in the process.`
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
     hoverTimerRef.current = null;
   }
-  const onEnter = (li, ti) => { cancelHide(); setHoverInfo({ lineIdx: li, tokenIdx: ti, overTooltip: false }); };
+
+  /** Beim ersten Hover ggf. DeepL-Einzelwort nachladen */
+  const onEnter = (li, ti) => {
+    cancelHide();
+    setHoverInfo({ lineIdx: li, tokenIdx: ti, overTooltip: false });
+
+    const line = lines[li];
+    if (line) {
+      const opts = line.translationOptions[ti] || [];
+      const meta = line.tokenMeta[ti] || {};
+      const tok  = line.tokens[ti]?.text || "";
+
+      if (!meta.isPunct && !meta.isName && tok && opts.length < 2) {
+        // leicht verzögert, damit der Tooltip sofort kommt
+        setTimeout(() => fetchDeepLForToken(li, ti), 0);
+      }
+    }
+  };
+
   const onLeave = () => { if (!hoverInfo.overTooltip) scheduleHide(); };
   const tipEnter = () => { cancelHide(); setHoverInfo(p => ({ ...p, overTooltip: true })); };
   const tipLeave = () => scheduleHide();
@@ -284,9 +369,13 @@ and to learn some words and culture in the process.`
     return (
       <div style={tip} onMouseEnter={tipEnter} onMouseLeave={tipLeave}>
         {merged.map((choice, i) => (
-          <div key={i} style={item} onMouseDown={(e) => { e.preventDefault(); pick(lineIdx, tokenIdx, choice); }}
-               onMouseOver={(e)=>{e.currentTarget.style.background="#fde68a"}}
-               onMouseOut={(e)=>{e.currentTarget.style.background="transparent"}}>
+          <div
+            key={i}
+            style={item}
+            onMouseDown={(e) => { e.preventDefault(); pick(lineIdx, tokenIdx, choice); }}
+            onMouseOver={(e)=>{e.currentTarget.style.background="#fde68a"}}
+            onMouseOut={(e)=>{e.currentTarget.style.background="transparent"}}
+          >
             {choice}
           </div>
         ))}
@@ -294,7 +383,7 @@ and to learn some words and culture in the process.`
     );
   }
 
-  /* -------- Render -------- */
+  /* ---------------- Render ---------------- */
   const card = { background: "#fff", borderRadius: 16, boxShadow: "0 6px 18px rgba(0,0,0,.06)", padding: 16 };
   const badge = (selected) => ({
     display: "inline-block", padding: "2px 8px", borderRadius: 12,
@@ -314,7 +403,7 @@ and to learn some words and culture in the process.`
         <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 8 }}>Birkenbihllab Trainer (EN → DE)</h1>
         <p style={{ color: "#475569", marginBottom: 16 }}>
           Text einfügen → <b>Aufbereiten</b> → Mouseover zeigt alle Bedeutungen; Klick setzt deine Wahl fett.
-          <br/>API: <code>{API_BASE}</code>
+          <br/>API: <code>{API_BASE || "(same-origin)"}</code>
         </p>
 
         <div style={card}>
