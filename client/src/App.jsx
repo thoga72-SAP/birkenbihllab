@@ -1,3 +1,4 @@
+// client/src/App.jsx
 import React, { useEffect, useRef, useState } from "react";
 
 /** --- Mini-Wörterbuch als Fallback (wird mit VkblDB gemerged) --- */
@@ -18,10 +19,10 @@ const COMMON_CAP_WORDS = new Set([
   "they","we","you","i"
 ]);
 
-/** gleiche Origin wie das Frontend (Render) */
+// gleicher Origin (Server liefert das Frontend aus)
 const API_BASE = "";
 
-/* ---------------- Hilfsfunktionen ---------------- */
+/* ---------------- Hilfen ---------------- */
 const isPunctuation = (s) => !!s && /^[^A-Za-zÄÖÜäöüß]+$/.test(s);
 
 function isLikelyName(str) {
@@ -36,10 +37,8 @@ function guessRole(tokens, idx) {
   const prev = tokens[idx - 1]?.text?.toLowerCase() || "";
   const prev2 = tokens[idx - 2]?.text?.toLowerCase() || "";
   const next = tokens[idx + 1]?.text?.toLowerCase() || "";
-
   const articleLike = new Set(["a", "an", "the", "this", "that", "these", "those"]);
   const modalLike = new Set(["will","can","could","should","would","may","might","shall","must"]);
-
   if (articleLike.has(prev)) return "noun";
   if (prev === "to") return "verb";
   if (prev === "and" && articleLike.has(next)) return "verb";
@@ -47,7 +46,6 @@ function guessRole(tokens, idx) {
   return "unknown";
 }
 
-/** Optionen sortieren, “bevorzugt”-Spam dämpfen, aber ALLES behalten */
 function rankAndKeepAllMeanings(engWord, rawOptions, roleGuess) {
   const lowerEng = (engWord || "").toLowerCase();
   const looksVerb = (g) => /\b\w+(en|ern|eln)\b/.test((g||"").trim());
@@ -77,25 +75,9 @@ function rankAndKeepAllMeanings(engWord, rawOptions, roleGuess) {
   return result;
 }
 
-/** DeepL-Antwort auf “kurzes, brauchbares Stück” eindampfen */
-function cleanDeepL(s = "") {
-  let t = String(s).trim();
+const tokenize = (s) => (s.match(/(\w+|'\w+|[^\s\w]+)/g) || []).map(t => ({ text: t }));
 
-  // Fälle ausschließen, in denen die Prompt-Anweisung gespiegelt wurde
-  if (/Übersetze möglichst wortwörtlich/i.test(t)) return "";
-
-  // nur den ersten sinnvollen Satzteil nehmen
-  t = t.split(/[\r\n.;!?]/)[0].trim();
-
-  // nicht zu lang
-  const wc = t.split(/\s+/).filter(Boolean).length;
-  if (!t || wc > 4 || t.length > 40) return "";
-
-  return t;
-}
-
-/* ================================================== */
-
+/* ---------------- Komponente ---------------- */
 export default function App() {
   const [inputText, setInputText] = useState(
 `James and Luke go on an accidental road trip in the south-west of England and record a rambling podcast,
@@ -103,12 +85,11 @@ while slowly going a bit mad. Will they make it to their destination before suns
 and to learn some words and culture in the process.`
   );
 
-  // Daten je Lernzeile
   const [lines, setLines] = useState([]);
   const [fullGermanText, setFullGermanText] = useState("");
   const [isTranslatingFull, setIsTranslatingFull] = useState(false);
 
-  // Vokabeldatenbank
+  // Vokabeldatenbank (Datei + User-Addons)
   const [vocabMap, setVocabMap] = useState({});
   const [vocabLoaded, setVocabLoaded] = useState(false);
 
@@ -116,8 +97,7 @@ and to learn some words and culture in the process.`
   const [hoverInfo, setHoverInfo] = useState({ lineIdx: null, tokenIdx: null, overTooltip: false });
   const hoverTimerRef = useRef(null);
   const tokenRefs = useRef({});
-
-  const tokenize = (s) => (s.match(/(\w+|'\w+|[^\s\w]+)/g) || []).map(t => ({ text: t }));
+  const pending = useRef(new Set()); // parallele Klick-Anfragen vermeiden
 
   /* -------- Vokabeldatei laden -------- */
   useEffect(() => {
@@ -147,50 +127,29 @@ and to learn some words and culture in the process.`
     })();
   }, []);
 
-  /* -------- DeepL-Einzelwort nachladen (beim Hover) -------- */
-  async function fetchDeepLForToken(lineIdx, tokenIdx) {
-    try {
-      const line = lines[lineIdx];
-      if (!line) return;
+  // User-Vokabeln vom Server mergen
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch(`${API_BASE}/api/vocab/user`);
+        if (!r.ok) return;
+        const d = await r.json();
+        const userMap = d?.vocab || {};
+        setVocabMap(prev => {
+          const merged = { ...prev };
+          for (const [k, arr] of Object.entries(userMap)) {
+            const set = new Set([...(merged[k] || []), ...arr]);
+            merged[k] = Array.from(set);
+          }
+          return merged;
+        });
+      } catch (e) {
+        console.warn('user vocab fetch failed', e);
+      }
+    })();
+  }, []);
 
-      const token = line.tokens[tokenIdx]?.text;
-      if (!token || isPunctuation(token) || line.tokenMeta[tokenIdx]?.isName) return;
-
-      const contextText = line.tokens.map(t => t.text).join(" ");
-
-      const r = await fetch(`${API_BASE}/api/translate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phraseText: token, contextText })
-      });
-      if (!r.ok) return;
-
-      const data = await r.json();
-      const deepl = cleanDeepL(data?.translatedText || "");
-      if (!deepl) return;
-
-      setLines(prev => {
-        const up = [...prev];
-        const l = { ...up[lineIdx] };
-        const opts = l.translationOptions.map(a => (a ? [...a] : []));
-        const tr  = [...l.translations];
-
-        const already = (opts[tokenIdx] || []).some(o => o.toLowerCase() === deepl.toLowerCase());
-        if (!already) (opts[tokenIdx] ||= []).push(deepl);
-
-        if (!tr[tokenIdx]) tr[tokenIdx] = deepl;
-
-        l.translationOptions = opts;
-        l.translations = tr;
-        up[lineIdx] = l;
-        return up;
-      });
-    } catch (e) {
-      console.warn("DeepL word fetch failed:", e);
-    }
-  }
-
-  /* -------- Aufbereiten (mit DeepL-Kontext) -------- */
+  /* -------- Aufbereiten: mit DeepL-Volltext-Kontext -------- */
   async function handlePrepare() {
     // 1) Volltext-Kontext holen
     let deepLFull = [];
@@ -208,7 +167,7 @@ and to learn some words and culture in the process.`
       }
     } catch (e) { console.warn("fulltext failed", e); }
 
-    // 2) Zeilen/Tokens bilden + Startübersetzungen
+    // 2) Zeilen/Tokens + Startübersetzungen
     const englishLines = inputText.split(/\r?\n/);
     const draft = englishLines.map((ln, lineIdx) => {
       const tokens = tokenize(ln);
@@ -232,12 +191,14 @@ and to learn some words and culture in the process.`
         const role = guessRole(tokens, idx);
         const ranked = rankAndKeepAllMeanings(w, mergedRaw, role);
 
-        // DeepL-Kandidat in der Nähe suchen (einfaches Fenster)
+        // DeepL-Kandidat aus dem Kontext (ganz einfache Nähe-Heuristik)
         let deepLCandidate = "";
         if (contextDE.length) {
-          const indices = [idx - 1, idx, idx + 1, idx + 2].filter(i => i >= 0 && i < contextDE.length);
-          const check = indices.map(i => contextDE[i]);
-          deepLCandidate = check.find(x => x && !/^(der|die|das|den|dem|des|ein|eine|einen|einem|einer|eines)$/i.test(x)) || "";
+          const checkPos = [idx - 1, idx, idx + 1, idx + 2]
+            .filter(i => i >= 0 && i < contextDE.length)
+            .map(i => contextDE[i]);
+          deepLCandidate =
+            checkPos.find(x => x && !/^(der|die|das|den|dem|des|ein|eine|einen|einem|einer|eines)$/i.test(x)) || "";
         }
 
         let best = ranked[0] || "";
@@ -252,7 +213,7 @@ and to learn some words and culture in the process.`
         opts[idx] = ranked.length ? ranked : (best ? [best] : []);
       });
 
-      // zu viele Wiederholungen derselben Übersetzung in EINER Zeile etwas streuen
+      // Wiederholungen in EINER Zeile etwas glätten
       const freq = Object.create(null);
       translations.forEach(t => { if (t) freq[t] = (freq[t] || 0) + 1; });
       translations.forEach((t, i) => {
@@ -287,7 +248,7 @@ and to learn some words and culture in the process.`
     }
   }
 
-  /* ---------------- Tooltip-Logik ---------------- */
+  /* -------- Tooltip -------- */
   function scheduleHide() {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
     hoverTimerRef.current = setTimeout(() => setHoverInfo({ lineIdx: null, tokenIdx: null, overTooltip: false }), 200);
@@ -296,25 +257,7 @@ and to learn some words and culture in the process.`
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
     hoverTimerRef.current = null;
   }
-
-  /** Beim ersten Hover ggf. DeepL-Einzelwort nachladen */
-  const onEnter = (li, ti) => {
-    cancelHide();
-    setHoverInfo({ lineIdx: li, tokenIdx: ti, overTooltip: false });
-
-    const line = lines[li];
-    if (line) {
-      const opts = line.translationOptions[ti] || [];
-      const meta = line.tokenMeta[ti] || {};
-      const tok  = line.tokens[ti]?.text || "";
-
-      if (!meta.isPunct && !meta.isName && tok && opts.length < 2) {
-        // leicht verzögert, damit der Tooltip sofort kommt
-        setTimeout(() => fetchDeepLForToken(li, ti), 0);
-      }
-    }
-  };
-
+  const onEnter = (li, ti) => { cancelHide(); setHoverInfo({ lineIdx: li, tokenIdx: ti, overTooltip: false }); };
   const onLeave = () => { if (!hoverInfo.overTooltip) scheduleHide(); };
   const tipEnter = () => { cancelHide(); setHoverInfo(p => ({ ...p, overTooltip: true })); };
   const tipLeave = () => scheduleHide();
@@ -369,13 +312,9 @@ and to learn some words and culture in the process.`
     return (
       <div style={tip} onMouseEnter={tipEnter} onMouseLeave={tipLeave}>
         {merged.map((choice, i) => (
-          <div
-            key={i}
-            style={item}
-            onMouseDown={(e) => { e.preventDefault(); pick(lineIdx, tokenIdx, choice); }}
-            onMouseOver={(e)=>{e.currentTarget.style.background="#fde68a"}}
-            onMouseOut={(e)=>{e.currentTarget.style.background="transparent"}}
-          >
+          <div key={i} style={item} onMouseDown={(e) => { e.preventDefault(); pick(lineIdx, tokenIdx, choice); }}
+               onMouseOver={(e)=>{e.currentTarget.style.background="#fde68a"}}
+               onMouseOut={(e)=>{e.currentTarget.style.background="transparent"}}>
             {choice}
           </div>
         ))}
@@ -383,7 +322,104 @@ and to learn some words and culture in the process.`
     );
   }
 
-  /* ---------------- Render ---------------- */
+  /* -------- Klick => DeepL-Einzelabfrage (2 Varianten) -------- */
+  async function fetchDeepLForToken(lineIdx, tokenIdx) {
+    const line = lines[lineIdx];
+    if (!line) return;
+
+    const rawWord = line.tokens[tokenIdx]?.text || '';
+    if (!rawWord || /[^A-Za-zÄÖÜäöüß']/.test(rawWord)) return; // nur Wörter
+
+    const key = `${lineIdx}-${tokenIdx}`;
+    if (pending.current.has(key)) return;
+    pending.current.add(key);
+
+    // 2 Varianten aufbauen
+    const lower = rawWord.toLowerCase();
+    const capFirst = rawWord[0].toUpperCase() + rawWord.slice(1).toLowerCase();
+    const variants = [rawWord, lower, capFirst];
+
+    try {
+      const contextText = line.tokens.map(t => t.text).join(' ');
+
+      const results = [];
+      for (const v of variants) {
+        const resp = await fetch(`${API_BASE}/api/translate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phraseText: v, contextText })
+        });
+        if (!resp.ok) continue;
+        const data = await resp.json();
+        let s = (data?.translatedText || '').trim();
+        s = s.split(/[\r\n]/)[0].split(/[.;!?]/)[0].trim();
+        if (/übersetze|phrase|kontext/i.test(s)) s = '';
+        if (s) results.push(s);
+      }
+
+      // Kandidaten deduplizieren
+      const seen = new Set();
+      const candidates = results.filter(x => {
+        const k = x.toLowerCase();
+        if (seen.has(k)) return false;
+        seen.add(k); return true;
+      });
+
+      if (!candidates.length) return;
+
+      // Heuristik: nimm bevorzugt die erste Übersetzung der Klein-Variante, sonst erste überhaupt
+      const preferred =
+        candidates.find(x => x.toLowerCase() === results[variants.indexOf(lower)]?.toLowerCase()) ||
+        candidates[0];
+
+      // 1) Optionen und Anzeige updaten
+      setLines(prev => {
+        const up = [...prev];
+        const ln = { ...up[lineIdx] };
+        const tr = [...ln.translations];
+        const cf = [...ln.confirmed];
+        const opts = ln.translationOptions.map(a => (a ? [...a] : []));
+
+        // alle Kandidaten vorne hinzufügen
+        const optSet = new Set(opts[tokenIdx].map(o => o.toLowerCase()));
+        for (const cand of [...candidates].reverse()) { // reverse -> preferred ganz vorne
+          if (!optSet.has(cand.toLowerCase())) opts[tokenIdx].unshift(cand);
+        }
+
+        // setzen, wenn leer/fragwürdig
+        if (!tr[tokenIdx] || tr[tokenIdx] === '_' || tr[tokenIdx].length > 30) {
+          tr[tokenIdx] = preferred;
+          cf[tokenIdx] = true;
+        }
+
+        ln.translations = tr;
+        ln.confirmed = cf;
+        ln.translationOptions = opts;
+        up[lineIdx] = ln;
+        return up;
+      });
+
+      // 2) Persist die gesetzte Übersetzung
+      await fetch(`${API_BASE}/api/vocab/add`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ eng: lower, ger: preferred })
+      });
+
+      // 3) Sofort auch in vocabMap mergen
+      setVocabMap(prev => {
+        const list = new Set([...(prev[lower] || []), preferred]);
+        return { ...prev, [lower]: Array.from(list) };
+      });
+
+    } catch (e) {
+      console.warn('DeepL single-word failed', e);
+    } finally {
+      pending.current.delete(key);
+    }
+  }
+
+  /* -------- Render -------- */
   const card = { background: "#fff", borderRadius: 16, boxShadow: "0 6px 18px rgba(0,0,0,.06)", padding: 16 };
   const badge = (selected) => ({
     display: "inline-block", padding: "2px 8px", borderRadius: 12,
@@ -394,7 +430,7 @@ and to learn some words and culture in the process.`
     display: "inline-block", padding: "2px 8px", borderRadius: 12,
     border: `1px solid ${isName ? "#93c5fd" : "transparent"}`,
     background: isName ? "#dbeafe" : "transparent",
-    fontSize: 20, fontWeight: 600, cursor: "default"
+    fontSize: 20, fontWeight: 600, cursor: "pointer"
   });
 
   return (
@@ -402,8 +438,8 @@ and to learn some words and culture in the process.`
       <div style={{ maxWidth: 1000, margin: "0 auto" }}>
         <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 8 }}>Birkenbihllab Trainer (EN → DE)</h1>
         <p style={{ color: "#475569", marginBottom: 16 }}>
-          Text einfügen → <b>Aufbereiten</b> → Mouseover zeigt alle Bedeutungen; Klick setzt deine Wahl fett.
-          <br/>API: <code>{API_BASE || "(same-origin)"}</code>
+          Text einfügen → <b>Aufbereiten</b> → Mouseover zeigt alle Bedeutungen; Klick holt DeepL und speichert sie.
+          <br />API: <code>{API_BASE || '(same origin)'}</code>
         </p>
 
         <div style={card}>
@@ -465,7 +501,8 @@ and to learn some words and culture in the process.`
                           style={eng(isName)}
                           onMouseEnter={() => !isPunctTok && onEnter(li, ti)}
                           onMouseLeave={onLeave}
-                          title={isPunctTok ? "" : "Mouseover für Optionen"}
+                          onClick={() => !isPunctTok && fetchDeepLForToken(li, ti)}
+                          title={isPunctTok ? "" : "Mouseover für Optionen, Klick holt DeepL"}
                         >
                           {tok.text}
                         </span>
