@@ -1,13 +1,9 @@
-// server/server.js  (CommonJS)
-
+// server/server.js
 require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-
-// node-fetch in CommonJS laden
-const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -15,74 +11,58 @@ const PORT = process.env.PORT || 3001;
 app.use(cors({ origin: process.env.ALLOW_ORIGIN || '*' }));
 app.use(express.json());
 
-// --- Healthcheck ---
-app.get('/health', (req, res) => res.send('ok'));
+// --- Health ---
+app.get('/health', (_req, res) => res.send('ok'));
 
-// --- DeepL: wortwörtliche Einzel-/Phrasen-Übersetzung ---
-app.post('/api/translate', async (req,res)=>{
-  try{
+// --- DeepL: Wort/Phrase ---
+app.post('/api/translate', async (req, res) => {
+  try {
     const { phraseText, contextText } = req.body || {};
     const key = process.env.DEEPL_KEY;
     const url = process.env.DEEPL_URL || 'https://api-free.deepl.com/v2/translate';
-    if(!key) return res.status(500).json({error:'DEEPL_KEY missing'});
+    if (!key) return res.status(500).json({ error: 'DEEPL_KEY missing' });
 
-    // Wichtig: nur das eigentliche Wort/Phrase an DeepL senden
     const text = phraseText || contextText || '';
-
     const params = new URLSearchParams({ auth_key: key, text, target_lang: 'DE' });
-    const r = await fetch(url, { method:'POST', body: params });
-    const data = await r.json();
-    res.json({ translatedText: data?.translations?.[0]?.text || '' });
-  }catch(e){
-    console.error(e);
-    res.status(500).json({error:'translate failed'});
-  }
-});
-
 
     const r = await fetch(url, { method: 'POST', body: params });
     const data = await r.json();
     return res.json({ translatedText: data?.translations?.[0]?.text || '' });
   } catch (e) {
-    console.error(e);
+    console.error('translate failed:', e);
     return res.status(500).json({ error: 'translate failed' });
   }
 });
 
-// --- DeepL: Volltext (Kontext zum Lesen) ---
+// --- DeepL: Volltext ---
 app.post('/api/translate/fulltext', async (req, res) => {
   try {
     const { fullText } = req.body || {};
     const key = process.env.DEEPL_KEY;
     const url = process.env.DEEPL_URL || 'https://api-free.deepl.com/v2/translate';
-
     if (!key) return res.status(500).json({ error: 'DEEPL_KEY missing' });
 
-    const params = new URLSearchParams({
-      auth_key: key,
-      text: fullText || '',
-      target_lang: 'DE',
-    });
+    const params = new URLSearchParams({ auth_key: key, text: fullText || '', target_lang: 'DE' });
 
     const r = await fetch(url, { method: 'POST', body: params });
     const data = await r.json();
     return res.json({ translatedText: data?.translations?.[0]?.text || '' });
   } catch (e) {
-    console.error(e);
+    console.error('fulltext failed:', e);
     return res.status(500).json({ error: 'fulltext failed' });
   }
 });
 
-// --- React-Frontend ausliefern (nach den API-Routen!) ---
+// --- React-Frontend ausliefern ---
 const clientBuildPath = path.join(__dirname, '..', 'client', 'dist');
 app.use(express.static(clientBuildPath));
 
-// SPA-Fallback: alle unbekannten Routen -> index.html
-app.get('*', (req, res) => {
+// SPA-Fallback
+app.get('*', (_req, res) => {
   res.sendFile(path.join(clientBuildPath, 'index.html'));
 });
 
-// --- Start ---
+// Start
 app.listen(PORT, () => {
   console.log('Server listening on', PORT);
 });
