@@ -497,15 +497,16 @@ and to learn some words and culture in the process.`
                     return (
                       <div key={ti} style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", minWidth: "max-content" }}>
                         <span
-                          ref={(el) => (tokenRefs.current[refKey] = el)}
-                          style={eng(isName)}
-                          onMouseEnter={() => !isPunctTok && onEnter(li, ti)}
-                          onMouseLeave={onLeave}
-                          onClick={() => !isPunctTok && fetchDeepLForToken(li, ti)}
-                          title={isPunctTok ? "" : "Mouseover für Optionen, Klick holt DeepL"}
+                           ref={(el) => (tokenRefs.current[refKey] = el)}
+                           style={{ ...eng(isName), cursor: isPunctTok ? "default" : "pointer" }}
+                           onMouseEnter={() => !isPunctTok && onEnter(li, ti)}
+                           onMouseLeave={onLeave}
+                           onClick={() => !isPunctTok && handleTokenClick(li, ti)}
+                           title={isPunctTok ? "" : "Mouseover für Optionen"}
                         >
                           {tok.text}
                         </span>
+
                         <span style={badge(isConfirmed)}>
                           {isPunctTok ? tok.text : (tr && tr.trim() !== "" ? tr : "_")}
                         </span>
