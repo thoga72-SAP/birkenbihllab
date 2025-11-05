@@ -1,4 +1,3 @@
-// client/src/App.jsx
 import React, { useEffect, useRef, useState } from "react";
 
 /** --- Mini-Wörterbuch als Fallback (wird mit VkblDB gemerged) --- */
@@ -19,65 +18,53 @@ const COMMON_CAP_WORDS = new Set([
   "they","we","you","i"
 ]);
 
-// gleicher Origin (Server liefert das Frontend aus)
-const API_BASE = "";
+/** WICHTIG: bei Render gleiche Origin verwenden */
+const API_BASE = ""; // gleiche Origin wie das Frontend
 
-/* ---------------- Hilfen ---------------- */
-const isPunctuation = (s) => !!s && /^[^A-Za-zÄÖÜäöüß]+$/.test(s);
+/* ---------- DeepL Helfer: EIN WORT, zweimal (Original + lowercase) ---------- */
+async function requestOneWordBothCasings(phrase, context) {
+  const headers = { "Content-Type": "application/json" };
 
-function isLikelyName(str) {
-  if (!str || isPunctuation(str) || !/[A-Za-zÄÖÜäöüß]/.test(str)) return false;
-  if (str === str.toUpperCase() && str.length > 1) return true; // WHO, UN
-  const cap = str[0] === str[0].toUpperCase() && str.slice(1) === str.slice(1).toLowerCase();
-  if (cap) return !COMMON_CAP_WORDS.has(str.toLowerCase());
-  return false;
+  const bodyCased = JSON.stringify({ phraseText: phrase,            contextText: context });
+  const bodyLower = JSON.stringify({ phraseText: phrase.toLowerCase(), contextText: context });
+
+  const results = [];
+
+  // 1) exakt wie geklickt
+  try {
+    const r = await fetch(`${API_BASE}/api/translate`, { method: "POST", headers, body: bodyCased });
+    if (r.ok) {
+      const d = await r.json();
+      if (d?.translatedText) results.push(d.translatedText.trim());
+    }
+  } catch (e) {
+    console.warn("DeepL (cased) failed:", e);
+  }
+
+  // 2) komplett klein
+  try {
+    const r = await fetch(`${API_BASE}/api/translate`, { method: "POST", headers, body: bodyLower });
+    if (r.ok) {
+      const d = await r.json();
+      if (d?.translatedText) results.push(d.translatedText.trim());
+    }
+  } catch (e) {
+    console.warn("DeepL (lower) failed:", e);
+  }
+
+  // Duplikate raus, kurze Kandidaten nach vorne
+  const seen = new Set();
+  return results
+    .map(s => s.replace(/\s+/g, " "))
+    .filter(s => {
+      const k = s.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .sort((a,b) => a.split(" ").length - b.split(" ").length);
 }
 
-function guessRole(tokens, idx) {
-  const prev = tokens[idx - 1]?.text?.toLowerCase() || "";
-  const prev2 = tokens[idx - 2]?.text?.toLowerCase() || "";
-  const next = tokens[idx + 1]?.text?.toLowerCase() || "";
-  const articleLike = new Set(["a", "an", "the", "this", "that", "these", "those"]);
-  const modalLike = new Set(["will","can","could","should","would","may","might","shall","must"]);
-  if (articleLike.has(prev)) return "noun";
-  if (prev === "to") return "verb";
-  if (prev === "and" && articleLike.has(next)) return "verb";
-  if (modalLike.has(prev) || modalLike.has(prev2)) return "verb";
-  return "unknown";
-}
-
-function rankAndKeepAllMeanings(engWord, rawOptions, roleGuess) {
-  const lowerEng = (engWord || "").toLowerCase();
-  const looksVerb = (g) => /\b\w+(en|ern|eln)\b/.test((g||"").trim());
-  const looksNoun = (g) => {
-    const f = (g || "").trim().split(/\s+/)[0] || "";
-    return f && f[0] === f[0].toUpperCase();
-  };
-  const overused = new Set(["bevorzugt", "bevorzugen"]);
-  const isPreferish = /^(prefer|prefers|preferred|preference|favor)$/i.test(lowerEng);
-
-  const scored = (rawOptions || []).map(opt => {
-    const cleaned = String(opt || "").trim();
-    if (!cleaned) return null;
-    let score = 0;
-    const wc = cleaned.split(/\s+/).length;
-    if (wc <= 3) score += 1;
-    if (wc === 1) score += 1;
-    if (roleGuess === "verb" && looksVerb(cleaned)) score += 2;
-    if (roleGuess === "noun" && looksNoun(cleaned)) score += 2;
-    if (overused.has(cleaned.toLowerCase()) && !isPreferish) score -= 3;
-    return { opt: cleaned, score };
-  }).filter(Boolean);
-
-  scored.sort((a, b) => (b.score - a.score) || a.opt.localeCompare(b.opt, "de"));
-  const seen = new Set(); const result = [];
-  for (const { opt } of scored) { const k = opt.toLowerCase(); if (seen.has(k)) continue; seen.add(k); result.push(opt); }
-  return result;
-}
-
-const tokenize = (s) => (s.match(/(\w+|'\w+|[^\s\w]+)/g) || []).map(t => ({ text: t }));
-
-/* ---------------- Komponente ---------------- */
 export default function App() {
   const [inputText, setInputText] = useState(
 `James and Luke go on an accidental road trip in the south-west of England and record a rambling podcast,
@@ -85,11 +72,12 @@ while slowly going a bit mad. Will they make it to their destination before suns
 and to learn some words and culture in the process.`
   );
 
+  // Daten je Lernzeile
   const [lines, setLines] = useState([]);
   const [fullGermanText, setFullGermanText] = useState("");
   const [isTranslatingFull, setIsTranslatingFull] = useState(false);
 
-  // Vokabeldatenbank (Datei + User-Addons)
+  // Vokabeldatenbank
   const [vocabMap, setVocabMap] = useState({});
   const [vocabLoaded, setVocabLoaded] = useState(false);
 
@@ -97,7 +85,61 @@ and to learn some words and culture in the process.`
   const [hoverInfo, setHoverInfo] = useState({ lineIdx: null, tokenIdx: null, overTooltip: false });
   const hoverTimerRef = useRef(null);
   const tokenRefs = useRef({});
-  const pending = useRef(new Set()); // parallele Klick-Anfragen vermeiden
+
+  /* -------- Hilfen -------- */
+  const isPunctuation = (s) => !!s && /^[^A-Za-zÄÖÜäöüß]+$/.test(s);
+
+  function isLikelyName(str) {
+    if (!str || isPunctuation(str) || !/[A-Za-zÄÖÜäöüß]/.test(str)) return false;
+    if (str === str.toUpperCase() && str.length > 1) return true; // WHO, UN
+    const cap = str[0] === str[0].toUpperCase() && str.slice(1) === str.slice(1).toLowerCase();
+    if (cap) return !COMMON_CAP_WORDS.has(str.toLowerCase());
+    return false;
+  }
+
+  function guessRole(tokens, idx) {
+    const prev = tokens[idx - 1]?.text?.toLowerCase() || "";
+    const prev2 = tokens[idx - 2]?.text?.toLowerCase() || "";
+    const next = tokens[idx + 1]?.text?.toLowerCase() || "";
+    const articleLike = new Set(["a", "an", "the", "this", "that", "these", "those"]);
+    const modalLike = new Set(["will","can","could","should","would","may","might","shall","must"]);
+    if (articleLike.has(prev)) return "noun";
+    if (prev === "to") return "verb";
+    if (prev === "and" && articleLike.has(next)) return "verb";
+    if (modalLike.has(prev) || modalLike.has(prev2)) return "verb";
+    return "unknown";
+  }
+
+  function rankAndKeepAllMeanings(engWord, rawOptions, roleGuess) {
+    const lowerEng = (engWord || "").toLowerCase();
+    const looksVerb = (g) => /\b\w+(en|ern|eln)\b/.test((g||"").trim());
+    const looksNoun = (g) => {
+      const f = (g || "").trim().split(/\s+/)[0] || "";
+      return f && f[0] === f[0].toUpperCase();
+    };
+    const overused = new Set(["bevorzugt", "bevorzugen"]);
+    const isPreferish = /^(prefer|prefers|preferred|preference|favor)$/i.test(lowerEng);
+
+    const scored = (rawOptions || []).map(opt => {
+      const cleaned = String(opt || "").trim();
+      if (!cleaned) return null;
+      let score = 0;
+      const wc = cleaned.split(/\s+/).length;
+      if (wc <= 3) score += 1;
+      if (wc === 1) score += 1;
+      if (roleGuess === "verb" && looksVerb(cleaned)) score += 2;
+      if (roleGuess === "noun" && looksNoun(cleaned)) score += 2;
+      if (overused.has(cleaned.toLowerCase()) && !isPreferish) score -= 3;
+      return { opt: cleaned, score };
+    }).filter(Boolean);
+
+    scored.sort((a, b) => (b.score - a.score) || a.opt.localeCompare(b.opt, "de"));
+    const seen = new Set(); const result = [];
+    for (const { opt } of scored) { const k = opt.toLowerCase(); if (seen.has(k)) continue; seen.add(k); result.push(opt); }
+    return result;
+  }
+
+  const tokenize = (s) => (s.match(/(\w+|'\w+|[^\s\w]+)/g) || []).map(t => ({ text: t }));
 
   /* -------- Vokabeldatei laden -------- */
   useEffect(() => {
@@ -127,29 +169,7 @@ and to learn some words and culture in the process.`
     })();
   }, []);
 
-  // User-Vokabeln vom Server mergen
-  useEffect(() => {
-    (async () => {
-      try {
-        const r = await fetch(`${API_BASE}/api/vocab/user`);
-        if (!r.ok) return;
-        const d = await r.json();
-        const userMap = d?.vocab || {};
-        setVocabMap(prev => {
-          const merged = { ...prev };
-          for (const [k, arr] of Object.entries(userMap)) {
-            const set = new Set([...(merged[k] || []), ...arr]);
-            merged[k] = Array.from(set);
-          }
-          return merged;
-        });
-      } catch (e) {
-        console.warn('user vocab fetch failed', e);
-      }
-    })();
-  }, []);
-
-  /* -------- Aufbereiten: mit DeepL-Volltext-Kontext -------- */
+  /* -------- Aufbereiten (mit DeepL-Kontext) -------- */
   async function handlePrepare() {
     // 1) Volltext-Kontext holen
     let deepLFull = [];
@@ -167,7 +187,7 @@ and to learn some words and culture in the process.`
       }
     } catch (e) { console.warn("fulltext failed", e); }
 
-    // 2) Zeilen/Tokens + Startübersetzungen
+    // 2) Zeilen/Tokens bilden + Startübersetzungen
     const englishLines = inputText.split(/\r?\n/);
     const draft = englishLines.map((ln, lineIdx) => {
       const tokens = tokenize(ln);
@@ -191,14 +211,13 @@ and to learn some words and culture in the process.`
         const role = guessRole(tokens, idx);
         const ranked = rankAndKeepAllMeanings(w, mergedRaw, role);
 
-        // DeepL-Kandidat aus dem Kontext (ganz einfache Nähe-Heuristik)
+        // DeepL-Kandidat in der Nähe suchen
         let deepLCandidate = "";
         if (contextDE.length) {
-          const checkPos = [idx - 1, idx, idx + 1, idx + 2]
+          const check = [idx - 1, idx, idx + 1, idx + 2]
             .filter(i => i >= 0 && i < contextDE.length)
             .map(i => contextDE[i]);
-          deepLCandidate =
-            checkPos.find(x => x && !/^(der|die|das|den|dem|des|ein|eine|einen|einem|einer|eines)$/i.test(x)) || "";
+          deepLCandidate = check.find(x => x && !/^(der|die|das|den|dem|des|ein|eine|einen|einem|einer|eines)$/i.test(x)) || "";
         }
 
         let best = ranked[0] || "";
@@ -213,7 +232,7 @@ and to learn some words and culture in the process.`
         opts[idx] = ranked.length ? ranked : (best ? [best] : []);
       });
 
-      // Wiederholungen in EINER Zeile etwas glätten
+      // zu viele Wiederholungen derselben Übersetzung in EINER Zeile etwas streuen
       const freq = Object.create(null);
       translations.forEach(t => { if (t) freq[t] = (freq[t] || 0) + 1; });
       translations.forEach((t, i) => {
@@ -312,9 +331,13 @@ and to learn some words and culture in the process.`
     return (
       <div style={tip} onMouseEnter={tipEnter} onMouseLeave={tipLeave}>
         {merged.map((choice, i) => (
-          <div key={i} style={item} onMouseDown={(e) => { e.preventDefault(); pick(lineIdx, tokenIdx, choice); }}
-               onMouseOver={(e)=>{e.currentTarget.style.background="#fde68a"}}
-               onMouseOut={(e)=>{e.currentTarget.style.background="transparent"}}>
+          <div
+            key={i}
+            style={item}
+            onMouseDown={(e) => { e.preventDefault(); pick(lineIdx, tokenIdx, choice); }}
+            onMouseOver={(e)=>{e.currentTarget.style.background="#fde68a"}}
+            onMouseOut={(e)=>{e.currentTarget.style.background="transparent"}}
+          >
             {choice}
           </div>
         ))}
@@ -322,100 +345,42 @@ and to learn some words and culture in the process.`
     );
   }
 
-  /* -------- Klick => DeepL-Einzelabfrage (2 Varianten) -------- */
-  async function fetchDeepLForToken(lineIdx, tokenIdx) {
+  /* -------- Klick auf ein Wort -> DeepL (Original + lowercase) -------- */
+  async function handleTokenClick(lineIdx, tokenIdx) {
     const line = lines[lineIdx];
-    if (!line) return;
+    const tok = line?.tokens?.[tokenIdx];
+    if (!line || !tok || line.tokenMeta[tokenIdx]?.isPunct) return;
 
-    const rawWord = line.tokens[tokenIdx]?.text || '';
-    if (!rawWord || /[^A-Za-zÄÖÜäöüß']/.test(rawWord)) return; // nur Wörter
+    const word = tok.text;
+    const context = line.tokens.map(t => t.text).join(" ");
 
-    const key = `${lineIdx}-${tokenIdx}`;
-    if (pending.current.has(key)) return;
-    pending.current.add(key);
-
-    // 2 Varianten aufbauen
-    const lower = rawWord.toLowerCase();
-    const capFirst = rawWord[0].toUpperCase() + rawWord.slice(1).toLowerCase();
-    const variants = [rawWord, lower, capFirst];
-
+    document.body.style.cursor = "wait";
     try {
-      const contextText = line.tokens.map(t => t.text).join(' ');
+      const deepLOpts = await requestOneWordBothCasings(word, context);
+      if (deepLOpts.length) {
+        setLines(prev => {
+          const up = [...prev];
+          const l = { ...up[lineIdx] };
+          const opts = l.translationOptions.map(a => (a ? [...a] : []));
+          const tr = [...l.translations];
 
-      const results = [];
-      for (const v of variants) {
-        const resp = await fetch(`${API_BASE}/api/translate`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ phraseText: v, contextText })
+          const have = new Set(opts[tokenIdx].map(o => o.toLowerCase()));
+          for (const o of deepLOpts) {
+            if (!have.has(o.toLowerCase())) {
+              opts[tokenIdx].unshift(o);
+              have.add(o.toLowerCase());
+            }
+          }
+          if (!tr[tokenIdx] && deepLOpts[0]) tr[tokenIdx] = deepLOpts[0];
+
+          l.translationOptions = opts;
+          l.translations = tr;
+          up[lineIdx] = l;
+          return up;
         });
-        if (!resp.ok) continue;
-        const data = await resp.json();
-        let s = (data?.translatedText || '').trim();
-        s = s.split(/[\r\n]/)[0].split(/[.;!?]/)[0].trim();
-        if (/übersetze|phrase|kontext/i.test(s)) s = '';
-        if (s) results.push(s);
       }
-
-      // Kandidaten deduplizieren
-      const seen = new Set();
-      const candidates = results.filter(x => {
-        const k = x.toLowerCase();
-        if (seen.has(k)) return false;
-        seen.add(k); return true;
-      });
-
-      if (!candidates.length) return;
-
-      // Heuristik: nimm bevorzugt die erste Übersetzung der Klein-Variante, sonst erste überhaupt
-      const preferred =
-        candidates.find(x => x.toLowerCase() === results[variants.indexOf(lower)]?.toLowerCase()) ||
-        candidates[0];
-
-      // 1) Optionen und Anzeige updaten
-      setLines(prev => {
-        const up = [...prev];
-        const ln = { ...up[lineIdx] };
-        const tr = [...ln.translations];
-        const cf = [...ln.confirmed];
-        const opts = ln.translationOptions.map(a => (a ? [...a] : []));
-
-        // alle Kandidaten vorne hinzufügen
-        const optSet = new Set(opts[tokenIdx].map(o => o.toLowerCase()));
-        for (const cand of [...candidates].reverse()) { // reverse -> preferred ganz vorne
-          if (!optSet.has(cand.toLowerCase())) opts[tokenIdx].unshift(cand);
-        }
-
-        // setzen, wenn leer/fragwürdig
-        if (!tr[tokenIdx] || tr[tokenIdx] === '_' || tr[tokenIdx].length > 30) {
-          tr[tokenIdx] = preferred;
-          cf[tokenIdx] = true;
-        }
-
-        ln.translations = tr;
-        ln.confirmed = cf;
-        ln.translationOptions = opts;
-        up[lineIdx] = ln;
-        return up;
-      });
-
-      // 2) Persist die gesetzte Übersetzung
-      await fetch(`${API_BASE}/api/vocab/add`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ eng: lower, ger: preferred })
-      });
-
-      // 3) Sofort auch in vocabMap mergen
-      setVocabMap(prev => {
-        const list = new Set([...(prev[lower] || []), preferred]);
-        return { ...prev, [lower]: Array.from(list) };
-      });
-
-    } catch (e) {
-      console.warn('DeepL single-word failed', e);
     } finally {
-      pending.current.delete(key);
+      document.body.style.cursor = "default";
     }
   }
 
@@ -430,7 +395,7 @@ and to learn some words and culture in the process.`
     display: "inline-block", padding: "2px 8px", borderRadius: 12,
     border: `1px solid ${isName ? "#93c5fd" : "transparent"}`,
     background: isName ? "#dbeafe" : "transparent",
-    fontSize: 20, fontWeight: 600, cursor: "pointer"
+    fontSize: 20, fontWeight: 600
   });
 
   return (
@@ -438,8 +403,8 @@ and to learn some words and culture in the process.`
       <div style={{ maxWidth: 1000, margin: "0 auto" }}>
         <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 8 }}>Birkenbihllab Trainer (EN → DE)</h1>
         <p style={{ color: "#475569", marginBottom: 16 }}>
-          Text einfügen → <b>Aufbereiten</b> → Mouseover zeigt alle Bedeutungen; Klick holt DeepL und speichert sie.
-          <br />API: <code>{API_BASE || '(same origin)'}</code>
+          Text einfügen → <b>Aufbereiten</b> → Mouseover zeigt alle Bedeutungen; Klick holt zusätzliche DeepL-Vorschläge.<br/>
+          API: <code>{API_BASE || "(same origin)"}</code>
         </p>
 
         <div style={card}>
@@ -497,16 +462,15 @@ and to learn some words and culture in the process.`
                     return (
                       <div key={ti} style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", minWidth: "max-content" }}>
                         <span
-                           ref={(el) => (tokenRefs.current[refKey] = el)}
-                           style={{ ...eng(isName), cursor: isPunctTok ? "default" : "pointer" }}
-                           onMouseEnter={() => !isPunctTok && onEnter(li, ti)}
-                           onMouseLeave={onLeave}
-                           onClick={() => !isPunctTok && handleTokenClick(li, ti)}
-                           title={isPunctTok ? "" : "Mouseover für Optionen"}
+                          ref={(el) => (tokenRefs.current[refKey] = el)}
+                          style={{ ...eng(isName), cursor: isPunctTok ? "default" : "pointer" }}
+                          onMouseEnter={() => !isPunctTok && onEnter(li, ti)}
+                          onMouseLeave={onLeave}
+                          onClick={() => !isPunctTok && handleTokenClick(li, ti)}
+                          title={isPunctTok ? "" : "Mouseover für Optionen / Klick = DeepL"}
                         >
                           {tok.text}
                         </span>
-
                         <span style={badge(isConfirmed)}>
                           {isPunctTok ? tok.text : (tr && tr.trim() !== "" ? tr : "_")}
                         </span>
@@ -522,4 +486,54 @@ and to learn some words and culture in the process.`
       {renderTooltip()}
     </div>
   );
+
+  /* ---- Tooltip Renderer am Ende halten, damit er Zugriff auf state hat ---- */
+  function renderTooltip() {
+    const { lineIdx, tokenIdx } = hoverInfo;
+    if (lineIdx == null || tokenIdx == null) return null;
+    const key = `${lineIdx}-${tokenIdx}`;
+    const el = tokenRefs.current[key]; if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const left = rect.left + window.scrollX, top = rect.bottom + window.scrollY + 4;
+    const line = lines[lineIdx]; if (!line) return null;
+    if (line.tokenMeta[tokenIdx]?.isPunct) return null;
+
+    const w = line.tokens[tokenIdx]?.text || "";
+    const lower = w.toLowerCase();
+    const fromState = line.translationOptions[tokenIdx] || [];
+    const fromFile = vocabMap[lower] || [];
+    const current = line.translations[tokenIdx] || "";
+
+    let merged = []; if (current) merged.push(current);
+    merged = merged.concat(fromState, fromFile);
+    const seen = new Set();
+    merged = merged.filter(o => { if (!o) return false; const k = o.trim().toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+    if (!merged.length) merged = ["(keine Optionen)"];
+
+    const tip = {
+      position: "absolute", left, top, zIndex: 9999,
+      background: "#fff7d6", border: "1px solid #eab308",
+      borderRadius: "8px", boxShadow: "0 10px 20px rgba(0,0,0,.15)",
+      padding: "8px 10px", fontSize: 14, color: "#1f2937",
+      minWidth: 160, maxWidth: 320, maxHeight: 220, overflowY: "auto"
+    };
+    const item = { cursor: "pointer", padding: "4px 6px", borderRadius: 6, lineHeight: 1.4, fontWeight: 500 };
+
+    return (
+      <div style={tip} onMouseEnter={() => { cancelHide(); setHoverInfo(p => ({ ...p, overTooltip: true })); }}
+           onMouseLeave={() => { if (hoverInfo.overTooltip) scheduleHide(); }}>
+        {merged.map((choice, i) => (
+          <div
+            key={i}
+            style={item}
+            onMouseDown={(e) => { e.preventDefault(); pick(lineIdx, tokenIdx, choice); }}
+            onMouseOver={(e)=>{e.currentTarget.style.background="#fde68a"}}
+            onMouseOut={(e)=>{e.currentTarget.style.background="transparent"}}
+          >
+            {choice}
+          </div>
+        ))}
+      </div>
+    );
+  }
 }
