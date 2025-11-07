@@ -1,4 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
+/* Prioritäten-Store (global + pro englischem Wort) */
+import { loadPriority, bumpPriority, sortWithPriority } from "./priorityStore";
 
 /** --- Mini-Wörterbuch als Fallback (wird mit VkblDB gemerged) --- */
 const DICT = {
@@ -99,10 +101,18 @@ and to learn some words and culture in the process.`
   const [vocabMap, setVocabMap] = useState({});
   const [vocabLoaded, setVocabLoaded] = useState(false);
 
+  // Prioritäten (global + pro englischem Wort)
+  const [prioState, setPrioState] = useState({ global: {}, perEng: {} });
+
   // Tooltip-Status
   const [hoverInfo, setHoverInfo] = useState({ lineIdx: null, tokenIdx: null, overTooltip: false });
   const hoverTimerRef = useRef(null);
   const tokenRefs = useRef({});
+
+  /* -------- Prioritäten laden -------- */
+  useEffect(() => {
+    setPrioState(loadPriority());
+  }, []);
 
   /* -------- Vokabeldatei laden -------- */
   useEffect(() => {
@@ -193,7 +203,10 @@ and to learn some words and culture in the process.`
 
         translations[idx] = best || "";
         confirmed[idx] = false;
-        opts[idx] = ranked.length ? ranked : (best ? [best] : []);
+
+        // bereits hier (erste Anzeige) nach Priorität sortieren:
+        const initialOpts = ranked.length ? ranked : (best ? [best] : []);
+        opts[idx] = sortWithPriority(prioState, w, initialOpts);
       });
 
       // Wiederholungen derselben Übersetzung in EINER Zeile leicht streuen
@@ -273,7 +286,7 @@ and to learn some words and culture in the process.`
 
     if (!newOptions.length) return;
 
-    // Ergebnis in den State mergen und das erste Ergebnis aktiv setzen
+    // Ergebnis in den State mergen, deduplizieren und nach Priorität sortieren
     setLines(prev => {
       const up = [...prev];
       const ln = { ...up[lineIdx] };
@@ -281,7 +294,6 @@ and to learn some words and culture in the process.`
       const cf = [...ln.confirmed];
       const opts = ln.translationOptions.map(a => (a ? [...a] : []));
 
-      // existierende + neue Optionen deduplizieren
       const merged = [...opts[tokenIdx], ...newOptions];
       const seen = new Set();
       const dedup = merged.filter(o => {
@@ -292,10 +304,13 @@ and to learn some words and culture in the process.`
         return true;
       });
 
+      // Nach Priorität sortieren, damit „gelerntes“ oben steht
+      const sorted = sortWithPriority(prioState, englishWord, dedup);
+
       // erste neue Option aktiv setzen
       tr[tokenIdx] = newOptions[0];
       cf[tokenIdx] = true;
-      opts[tokenIdx] = dedup;
+      opts[tokenIdx] = sorted;
 
       ln.translations = tr;
       ln.confirmed = cf;
@@ -322,17 +337,51 @@ and to learn some words and culture in the process.`
 
   function pick(lineIdx, tokenIdx, choice) {
     if (!choice || choice === "(keine Optionen)") return;
+
     setLines(prev => {
       const up = [...prev];
       const line = { ...up[lineIdx] };
       const tr = [...line.translations];
       const cf = [...line.confirmed];
       const opts = line.translationOptions.map(a => (a ? [...a] : []));
-      tr[tokenIdx] = choice; cf[tokenIdx] = true;
-      opts[tokenIdx] = [choice, ...opts[tokenIdx].filter(o => o !== choice)];
-      line.translations = tr; line.confirmed = cf; line.translationOptions = opts;
-      up[lineIdx] = line; return up;
+
+      tr[tokenIdx] = choice; 
+      cf[tokenIdx] = true;
+
+      // Optionen deduplizieren und nach Priorität sortieren
+      const merged = [choice, ...opts[tokenIdx].filter(o => o !== choice)];
+      const seen = new Set();
+      const dedup = merged.filter(o => {
+        const k = (o || "").toLowerCase().trim();
+        if (!k) return false;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+
+      const engWord = line.tokens[tokenIdx]?.text || "";
+      const sorted = sortWithPriority(prioState, engWord, dedup);
+
+      line.translations = tr; 
+      line.confirmed = cf; 
+      line.translationOptions = [...opts];
+      line.translationOptions[tokenIdx] = sorted;
+
+      up[lineIdx] = line; 
+      return up;
     });
+
+    // Priorität hochzählen (global + pro englischem Wort) und State speichern
+    const engWord = (lines[lineIdx]?.tokens[tokenIdx]?.text || "").toLowerCase();
+    setPrioState(prev => {
+      const next = bumpPriority(
+        { global: { ...prev.global }, perEng: { ...prev.perEng } },
+        engWord,
+        choice
+      );
+      return { ...next };
+    });
+
     setHoverInfo({ lineIdx: null, tokenIdx: null, overTooltip: false });
   }
 
@@ -352,10 +401,23 @@ and to learn some words and culture in the process.`
     const fromFile = vocabMap[lower] || [];
     const current = line.translations[tokenIdx] || "";
 
-    let merged = []; if (current) merged.push(current);
+    let merged = []; 
+    if (current) merged.push(current);
     merged = merged.concat(fromState, fromFile);
+
+    // Duplikate entfernen
     const seen = new Set();
-    merged = merged.filter(o => { if (!o) return false; const k = o.trim().toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+    merged = merged.filter(o => {
+      if (!o) return false; 
+      const k = o.trim().toLowerCase(); 
+      if (seen.has(k)) return false; 
+      seen.add(k); 
+      return true;
+    });
+
+    // Nach Priorität sortieren (perEng > global > alphabetisch)
+    merged = sortWithPriority(prioState, w, merged);
+
     if (!merged.length) merged = ["(keine Optionen)"];
 
     const tip = {
@@ -397,7 +459,7 @@ and to learn some words and culture in the process.`
     display: "inline-block", padding: "2px 8px", borderRadius: 12,
     border: `1px solid ${isName ? "#93c5fd" : "transparent"}`,
     background: isName ? "#dbeafe" : "transparent",
-    fontSize: 20, fontWeight: 600, cursor: "pointer"  // wichtig: pointer (klickbar)
+    fontSize: 20, fontWeight: 600, cursor: "pointer"
   });
 
   return (
@@ -469,7 +531,7 @@ and to learn some words and culture in the process.`
                           style={eng(isName)}
                           onMouseEnter={() => !isPunctTok && onEnter(li, ti)}
                           onMouseLeave={onLeave}
-                          onClick={() => !isPunctTok && handleTokenClick(li, ti)}   // <<< Ein-Klick DeepL
+                          onClick={() => !isPunctTok && handleTokenClick(li, ti)}
                           title={isPunctTok ? "" : "Mouseover für Optionen / Klick = DeepL-Lookup"}
                         >
                           {tok.text}
