@@ -5,12 +5,8 @@ const LS_PER_ENG = "prio_per_eng_v1";
 export function loadPriority() {
   let global = {};
   let perEng = {};
-  try {
-    global = JSON.parse(localStorage.getItem(LS_GLOBAL) || "{}");
-  } catch {}
-  try {
-    perEng = JSON.parse(localStorage.getItem(LS_PER_ENG) || "{}");
-  } catch {}
+  try { global = JSON.parse(localStorage.getItem(LS_GLOBAL) || "{}"); } catch {}
+  try { perEng = JSON.parse(localStorage.getItem(LS_PER_ENG) || "{}"); } catch {}
   return { global, perEng };
 }
 
@@ -43,19 +39,27 @@ export function bumpPriority(state, engWord, chosenDe) {
   return next;
 }
 
-/** Liste nach Priorität sortieren: perEng > global > alphabetisch */
+/** Punkte für Anzeige (Summe aus perEng + global) */
+export function countFor(state, engWord, de) {
+  const eng = (engWord || "").toLowerCase();
+  const d = (de || "").trim();
+  const per = (state.perEng && state.perEng[eng] && state.perEng[eng][d]) || 0;
+  const g = (state.global && state.global[d]) || 0;
+  return per + g;
+}
+
+/** Sortierung: perEng > global > alphabetisch */
 export function sortWithPriority(state, engWord, options) {
   const eng = (engWord || "").toLowerCase();
   const per = (state.perEng && state.perEng[eng]) || {};
   const global = state.global || {};
 
   return [...(options || [])].sort((a, b) => {
-    const aa = (a || "").trim();
-    const bb = (b || "").trim();
+    const aa = (a || "").trim(), bb = (b || "").trim();
     const pa = per[aa] || 0, pb = per[bb] || 0;
-    if (pb !== pa) return pb - pa; // perEng wichtiger
+    if (pb !== pa) return pb - pa;
     const ga = global[aa] || 0, gb = global[bb] || 0;
-    if (gb !== ga) return gb - ga; // dann global
+    if (gb !== ga) return gb - ga;
     return aa.localeCompare(bb, "de");
   });
 }
