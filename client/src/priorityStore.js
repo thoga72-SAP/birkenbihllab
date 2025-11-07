@@ -1,70 +1,61 @@
 // client/src/priorityStore.js
-
-const LS_KEY = "prio_v1"; // alles hier drin
-
-// Struktur in localStorage:
-// {
-//   global: { "machen": 12, "finden": 4, ... },
-//   perEng: { "make": { "machen": 7, "herstellen": 3 }, "find": {...} }
-// }
+const LS_GLOBAL = "prio_global_v1";
+const LS_PER_ENG = "prio_per_eng_v1";
 
 export function loadPriority() {
+  let global = {};
+  let perEng = {};
   try {
-    const raw = localStorage.getItem(LS_KEY);
-    if (!raw) return { global: {}, perEng: {} };
-    const parsed = JSON.parse(raw);
-    return {
-      global: parsed.global || {},
-      perEng: parsed.perEng || {},
-    };
-  } catch {
-    return { global: {}, perEng: {} };
-  }
+    global = JSON.parse(localStorage.getItem(LS_GLOBAL) || "{}");
+  } catch {}
+  try {
+    perEng = JSON.parse(localStorage.getItem(LS_PER_ENG) || "{}");
+  } catch {}
+  return { global, perEng };
 }
 
-export function savePriority(state) {
+function savePriority(state) {
   try {
-    localStorage.setItem(LS_KEY, JSON.stringify(state));
-  } catch { /* ignore quota errors */ }
+    localStorage.setItem(LS_GLOBAL, JSON.stringify(state.global || {}));
+    localStorage.setItem(LS_PER_ENG, JSON.stringify(state.perEng || {}));
+  } catch {}
 }
 
-// ++1 für eine gewählte Übersetzung
-export function bumpPriority(state, engWord, germanChoice) {
-  const eng = String(engWord || "").toLowerCase();
-  const ger = String(germanChoice || "").toLowerCase();
+/** Priorität erhöhen (global + pro englischem Wort) */
+export function bumpPriority(state, engWord, chosenDe) {
+  const eng = (engWord || "").toLowerCase();
+  const de = (chosenDe || "").trim();
+  if (!de) return state;
+
+  const next = {
+    global: { ...(state.global || {}) },
+    perEng: { ...(state.perEng || {}) }
+  };
 
   // global
-  state.global[ger] = (state.global[ger] || 0) + 1;
+  next.global[de] = (next.global[de] || 0) + 1;
 
-  // pro englisches Wort
-  if (!state.perEng[eng]) state.perEng[eng] = {};
-  state.perEng[eng][ger] = (state.perEng[eng][ger] || 0) + 1;
+  // per-english
+  next.perEng[eng] = next.perEng[eng] || {};
+  next.perEng[eng][de] = (next.perEng[eng][de] || 0) + 1;
 
-  savePriority(state);
-  return state;
+  savePriority(next);
+  return next;
 }
 
-// Sortiert Kandidaten nach:
-// 1) perEng[eng][ger] absteigend
-// 2) global[ger] absteigend
-// 3) alphabetisch (de)
-export function sortWithPriority(state, engWord, candidates) {
-  const eng = String(engWord || "").toLowerCase();
-  const per = state.perEng[eng] || {};
-  const glob = state.global || {};
+/** Liste nach Priorität sortieren: perEng > global > alphabetisch */
+export function sortWithPriority(state, engWord, options) {
+  const eng = (engWord || "").toLowerCase();
+  const per = (state.perEng && state.perEng[eng]) || {};
+  const global = state.global || {};
 
-  return [...candidates].sort((a, b) => {
-    const aa = String(a || "").toLowerCase();
-    const bb = String(b || "").toLowerCase();
-
-    const pa = per[aa] || 0;
-    const pb = per[bb] || 0;
-    if (pb !== pa) return pb - pa;
-
-    const ga = glob[aa] || 0;
-    const gb = glob[bb] || 0;
-    if (gb !== ga) return gb - ga;
-
-    return String(a).localeCompare(String(b), "de");
+  return [...(options || [])].sort((a, b) => {
+    const aa = (a || "").trim();
+    const bb = (b || "").trim();
+    const pa = per[aa] || 0, pb = per[bb] || 0;
+    if (pb !== pa) return pb - pa; // perEng wichtiger
+    const ga = global[aa] || 0, gb = global[bb] || 0;
+    if (gb !== ga) return gb - ga; // dann global
+    return aa.localeCompare(bb, "de");
   });
 }
