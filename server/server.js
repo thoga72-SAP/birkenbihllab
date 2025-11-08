@@ -1,6 +1,44 @@
 // server/server.js
 require("dotenv").config();
 
+const { Pool } = require('pg');
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL, // auf Render gesetzt
+  ssl: { rejectUnauthorized: false }          // Render-Postgres verlangt SSL
+});
+
+// einmalig Tabelle anlegen (idempotent)
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS vocab (
+        eng TEXT NOT NULL,
+        de  TEXT NOT NULL,
+        prio INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL DEFAULT 'user',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (eng, de)
+      );
+    `);
+    console.log('DB ready ✔');
+  } catch (e) {
+    console.error('DB init failed', e);
+  }
+})();
+
+// einfacher Health-Check
+app.get('/api/db/health', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT NOW() as now;');
+    res.json({ ok: true, now: r.rows[0].now });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: 'db-failed' });
+  }
+});
+
+
 const path = require("path");
 const express = require("express");
 const cors = require("cors");
