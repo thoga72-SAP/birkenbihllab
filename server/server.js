@@ -1,256 +1,220 @@
 // server/server.js
-require("dotenv").config();
+require('dotenv').config();
 
-const { Pool } = require('pg');
+const path = require('path');
+const express = require('express');
+const cors = require('cors');
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, // auf Render gesetzt
-  ssl: { rejectUnauthorized: false }          // Render-Postgres verlangt SSL
-});
+// node-fetch als ESM dynamisch laden, aber hier CommonJS verwenden
+const fetch = (...args) =>
+  import('node-fetch').then(({ default: f }) => f(...args));
 
-// einmalig Tabelle anlegen (idempotent)
-(async () => {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS vocab (
-        eng TEXT NOT NULL,
-        de  TEXT NOT NULL,
-        prio INTEGER NOT NULL DEFAULT 0,
-        source TEXT NOT NULL DEFAULT 'user',
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (eng, de)
-      );
-    `);
-    console.log('DB ready ✔');
-  } catch (e) {
-    console.error('DB init failed', e);
-  }
-})();
-
-// einfacher Health-Check
-app.get('/api/db/health', async (req, res) => {
-  try {
-    const r = await pool.query('SELECT NOW() as now;');
-    res.json({ ok: true, now: r.rows[0].now });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: 'db-failed' });
-  }
-});
-
-
-const path = require("path");
-const express = require("express");
-const cors = require("cors");
-const { Pool } = require("pg");
-
-// fetch in CommonJS
-const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
-
+// ---------- Express-Grundsetup ----------
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ---- CORS (auf Render gleicher Origin – lokal ggf. localhost erlauben)
-app.use(cors({ origin: process.env.ALLOW_ORIGIN || "*" }));
+app.use(
+  cors({
+    origin: process.env.ALLOW_ORIGIN || '*',
+  })
+);
 app.use(express.json());
 
-// ---- PostgreSQL
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
-});
+// ---------- PostgreSQL (einziger Pool, Singleton) ----------
+let pgPool = null;
+function getPgPool() {
+  if (pgPool) return pgPool;
 
-// Tabelle anlegen
+  const { Pool } = require('pg'); // <- nur HIER require('pg')
+  const connStr =
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.PG_CONNECTION_STRING;
+
+  if (!connStr) {
+    console.warn(
+      '[PG] DATABASE_URL nicht gesetzt – Vokabel-Funktionen sind deaktiviert.'
+    );
+    return null;
+  }
+
+  pgPool = new Pool({
+    connectionString: connStr,
+    ssl: { rejectUnauthorized: false }, // Render-managed DBs
+  });
+  return pgPool;
+}
+
 async function ensureSchema() {
+  const pool = getPgPool();
+  if (!pool) return;
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS vocab (
-      word TEXT PRIMARY KEY,
-      options JSONB NOT NULL DEFAULT '[]'::jsonb,
-      counts  JSONB NOT NULL DEFAULT '{}'::jsonb
+      id           BIGSERIAL PRIMARY KEY,
+      eng          TEXT NOT NULL,
+      ger          TEXT NOT NULL,
+      priority     INTEGER NOT NULL DEFAULT 0,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (eng, ger)
     );
+    CREATE INDEX IF NOT EXISTS idx_vocab_eng ON vocab(LOWER(eng));
   `);
+  console.log('[PG] Tabelle "vocab" bereit.');
 }
-ensureSchema().catch(console.error);
 
-// Hilfen
-async function getRow(word) {
-  const { rows } = await pool.query(`SELECT word, options, counts FROM vocab WHERE word=$1`, [word]);
-  if (rows.length) return rows[0];
-  return { word, options: [], counts: {} };
-}
-function addUnique(optionsArr, additions) {
-  const set = new Set((optionsArr || []).map(o => String(o).trim().toLowerCase()));
-  const out = [...(optionsArr || [])];
-  for (const a of additions || []) {
-    const k = String(a || "").trim();
-    if (k && !set.has(k.toLowerCase())) {
-      set.add(k.toLowerCase());
-      out.push(k);
-    }
+// ---------- DeepL Helper ----------
+async function deeplTranslate({ text, target = 'DE' }) {
+  const key = process.env.DEEPL_KEY;
+  const url =
+    process.env.DEEPL_URL || 'https://api-free.deepl.com/v2/translate';
+
+  if (!key) {
+    return { ok: false, error: 'DEEPL_KEY missing' };
   }
-  return out;
-}
-function incCount(counts, choice, incBy = 1) {
-  const c = { ...(counts || {}) };
-  const key = String(choice || "").trim();
-  if (!key) return c;
-  const cur = Number(c[key] || 0);
-  c[key] = cur + incBy;
-  return c;
-}
-function sortWithCounts(options, counts) {
-  return [...(options || [])].sort((a, b) => {
-    const ca = Number((counts || {})[a] || 0);
-    const cb = Number((counts || {})[b] || 0);
-    if (cb !== ca) return cb - ca;
-    return a.localeCompare(b, "de");
+
+  const params = new URLSearchParams({
+    auth_key: key,
+    text,
+    target_lang: target,
   });
+
+  const r = await fetch(url, {
+    method: 'POST',
+    body: params,
+  });
+
+  if (!r.ok) {
+    const body = await r.text().catch(() => '');
+    return {
+      ok: false,
+      error: `DeepL HTTP ${r.status}`,
+      body,
+    };
+  }
+
+  const data = await r.json();
+  const translated =
+    data && data.translations && data.translations[0]
+      ? data.translations[0].text || ''
+      : '';
+
+  return { ok: true, text: translated };
 }
 
-// ---- API: Vokabel abrufen
-app.get("/api/vocab", async (req, res) => {
-  try {
-    const word = String(req.query.word || "").toLowerCase().trim();
-    if (!word) return res.json({ word: "", options: [], counts: {} });
-    const row = await getRow(word);
-    const sorted = sortWithCounts(row.options, row.counts);
-    res.json({ word, options: sorted, counts: row.counts || {} });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "vocab get failed" });
-  }
-});
+// ---------- API: Health ----------
+app.get('/health', (_req, res) => res.send('ok'));
 
-// ---- API: Auswahl zählen + Option sicherstellen
-app.post("/api/vocab/choose", async (req, res) => {
-  try {
-    const word = String(req.body.word || "").toLowerCase().trim();
-    const choice = String(req.body.choice || "").trim();
-    if (!word || !choice) return res.status(400).json({ error: "missing word/choice" });
-
-    const row = await getRow(word);
-    const options = addUnique(row.options, [choice]);
-    const counts = incCount(row.counts, choice, 1);
-
-    await pool.query(
-      `INSERT INTO vocab(word, options, counts)
-       VALUES ($1, $2::jsonb, $3::jsonb)
-       ON CONFLICT (word)
-       DO UPDATE SET options = EXCLUDED.options, counts = EXCLUDED.counts`,
-      [word, JSON.stringify(options), JSON.stringify(counts)]
-    );
-
-    res.json({ word, options: sortWithCounts(options, counts), counts });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "vocab choose failed" });
-  }
-});
-
-// ---- API: manuelle Option hinzufügen (optional: increment)
-app.post("/api/vocab/manual", async (req, res) => {
-  try {
-    const word = String(req.body.word || "").toLowerCase().trim();
-    const translation = String(req.body.translation || "").trim();
-    const increment = !!req.body.increment;
-    if (!word || !translation) return res.status(400).json({ error: "missing word/translation" });
-
-    const row = await getRow(word);
-    const options = addUnique(row.options, [translation]);
-    const counts = increment ? incCount(row.counts, translation, 1) : (row.counts || {});
-
-    await pool.query(
-      `INSERT INTO vocab(word, options, counts)
-       VALUES ($1, $2::jsonb, $3::jsonb)
-       ON CONFLICT (word)
-       DO UPDATE SET options = EXCLUDED.options, counts = EXCLUDED.counts`,
-      [word, JSON.stringify(options), JSON.stringify(counts)]
-    );
-
-    res.json({ word, options: sortWithCounts(options, counts), counts });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "vocab manual failed" });
-  }
-});
-
-// ---- API: mehrere Optionen “nur hinzufügen”
-app.post("/api/vocab/upsertMany", async (req, res) => {
-  try {
-    const word = String(req.body.word || "").toLowerCase().trim();
-    const optionsIn = Array.isArray(req.body.options) ? req.body.options.map(x => String(x || "").trim()).filter(Boolean) : [];
-    if (!word || !optionsIn.length) return res.status(400).json({ error: "missing word/options" });
-
-    const row = await getRow(word);
-    const options = addUnique(row.options, optionsIn);
-    const counts  = row.counts || {};
-
-    await pool.query(
-      `INSERT INTO vocab(word, options, counts)
-       VALUES ($1, $2::jsonb, $3::jsonb)
-       ON CONFLICT (word)
-       DO UPDATE SET options = EXCLUDED.options`,
-      [word, JSON.stringify(options), JSON.stringify(counts)]
-    );
-
-    res.json({ word, options: sortWithCounts(options, counts), counts });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "vocab upsertMany failed" });
-  }
-});
-
-// ---- DeepL Relay
-app.post("/api/translate", async (req, res) => {
+// ---------- API: Einzelwort-/Phrasen-Übersetzung ----------
+app.post('/api/translate', async (req, res) => {
   try {
     const { phraseText, contextText } = req.body || {};
-    const key = process.env.DEEPL_KEY;
-    const url = process.env.DEEPL_URL || "https://api-free.deepl.com/v2/translate";
-    if (!key) return res.status(500).json({ error: "DEEPL_KEY missing" });
+    // Prompt NICHT an den Client zurückgeben, sondern nur Ergebnis
+    const prompt = `Übersetze möglichst wortwörtlich ins Deutsche (max. 3 Wörter). Phrase: "${phraseText ?? ''}". Kontext: "${contextText ?? ''}".`;
 
-    const prompt = `Übersetze möglichst wortwörtlich ins Deutsche (max. 3 Wörter). Phrase: "${phraseText}". Kontext: "${contextText}"`;
-    const params = new URLSearchParams({ auth_key: key, text: prompt, target_lang: "DE" });
+    const result = await deeplTranslate({ text: prompt, target: 'DE' });
+    if (!result.ok) {
+      return res.status(500).json({ error: result.error });
+    }
 
-    const r = await fetch(url, { method: "POST", body: params });
-    const data = await r.json();
-    const text = (data && data.translations && data.translations[0] && data.translations[0].text) || "";
+    // Kurz bereinigen: erste Zeile / vor Satzzeichen cutten, max. 3 Wörter
+    let cleaned = (result.text || '').split(/[\r\n]/)[0].split(/[.;!?]/)[0].trim();
+    const parts = cleaned.split(/\s+/).filter(Boolean).slice(0, 3);
+    cleaned = parts.join(' ');
 
-    // Nur die eigentliche Übersetzung zurückgeben (erste Zeile/Satz, max 3 Wörter)
-    const line = text.split(/[\r\n]/)[0].split(/[.;!?]/)[0].trim();
-    const trimmed = line.split(/\s+/).slice(0, 3).join(" ");
-    res.json({ translatedText: trimmed });
+    return res.json({ translatedText: cleaned });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "translate failed" });
+    console.error('[translate] error:', e);
+    res.status(500).json({ error: 'translate failed' });
   }
 });
 
-app.post("/api/translate/fulltext", async (req, res) => {
+// ---------- API: Volltext-Kontext ----------
+app.post('/api/translate/fulltext', async (req, res) => {
   try {
     const { fullText } = req.body || {};
-    const key = process.env.DEEPL_KEY;
-    const url = process.env.DEEPL_URL || "https://api-free.deepl.com/v2/translate";
-    if (!key) return res.status(500).json({ error: "DEEPL_KEY missing" });
-
-    const params = new URLSearchParams({ auth_key: key, text: fullText || "", target_lang: "DE" });
-    const r = await fetch(url, { method: "POST", body: params });
-    const data = await r.json();
-    const text = (data && data.translations && data.translations[0] && data.translations[0].text) || "";
-    res.json({ translatedText: text });
+    const result = await deeplTranslate({ text: fullText || '', target: 'DE' });
+    if (!result.ok) {
+      return res.status(500).json({ error: result.error });
+    }
+    return res.json({ translatedText: result.text || '' });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "fulltext failed" });
+    console.error('[fulltext] error:', e);
+    res.status(500).json({ error: 'fulltext failed' });
   }
 });
 
-// ---- Health
-app.get("/health", (req, res) => res.send("ok"));
+// ---------- API: Vokabeln (persistente Priorität & manuelle Eingaben) ----------
 
-// ---- React-Frontend ausliefern
-const clientBuildPath = path.join(__dirname, "..", "client", "dist");
-app.use(express.static(clientBuildPath));
-app.get("*", (req, res) => {
-  res.sendFile(path.join(clientBuildPath, "index.html"));
+// GET /api/vocab?eng=word  -> liefert gespeicherte GER-Optionen (sortiert nach priority desc, ger asc)
+app.get('/api/vocab', async (req, res) => {
+  try {
+    const pool = getPgPool();
+    if (!pool) return res.json({ items: [] });
+
+    const eng = String(req.query.eng || '').trim().toLowerCase();
+    if (!eng) return res.json({ items: [] });
+
+    const { rows } = await pool.query(
+      `SELECT ger, priority
+         FROM vocab
+        WHERE LOWER(eng) = LOWER($1)
+        ORDER BY priority DESC, ger ASC
+      `,
+      [eng]
+    );
+
+    return res.json({ items: rows || [] });
+  } catch (e) {
+    console.error('[vocab GET] error:', e);
+    res.status(500).json({ error: 'vocab get failed' });
+  }
 });
 
-app.listen(PORT, () => console.log("Server listening on", PORT));
+// POST /api/vocab/save { eng, ger, inc = 1 } -> upsert + priority erhöhen
+app.post('/api/vocab/save', async (req, res) => {
+  try {
+    const pool = getPgPool();
+    if (!pool) return res.json({ ok: true, skipped: true });
+
+    const { eng, ger, inc = 1 } = req.body || {};
+    const engNorm = String(eng || '').trim().toLowerCase();
+    const gerNorm = String(ger || '').trim();
+
+    if (!engNorm || !gerNorm) return res.status(400).json({ error: 'bad input' });
+
+    await pool.query(
+      `
+      INSERT INTO vocab (eng, ger, priority)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (eng, ger)
+      DO UPDATE SET priority = vocab.priority + EXCLUDED.priority
+      `,
+      [engNorm, gerNorm, Number(inc) || 1]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[vocab SAVE] error:', e);
+    res.status(500).json({ error: 'vocab save failed' });
+  }
+});
+
+// ---------- Static Frontend ausliefern ----------
+const clientBuildPath = path.join(__dirname, '..', 'client', 'dist');
+app.use(express.static(clientBuildPath));
+
+// Fallback auf index.html (SPA)
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(clientBuildPath, 'index.html'));
+});
+
+// ---------- Start ----------
+app.listen(PORT, async () => {
+  try {
+    await ensureSchema();
+  } catch (e) {
+    console.warn('[PG] Schema-Init übersprungen:', e?.message || e);
+  }
+  console.log(`[server] listening on ${PORT}`);
+});
