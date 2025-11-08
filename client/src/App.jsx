@@ -45,7 +45,7 @@ and to learn some words and culture in the process.`
     overTooltip: false,
   });
   const hoverTimerRef = useRef(null);
-  const tokenRefs = useRef(Object.create(null));
+  const tokenRefs = useRef({}); // robustere Default-Struktur
 
   /* -------- Vokabeldatei laden -------- */
   useEffect(() => {
@@ -110,7 +110,7 @@ and to learn some words and culture in the process.`
 
       tokens.forEach((tok, idx) => {
         const w = tok.text;
-        const lower = w.toLowerCase();
+        const lower = (w || "").toLowerCase();
         const punct = isPunctuation(w);
         meta[idx] = { isPunct: punct, isName: false }; // (Namenserkennung hier aktuell nicht aktiv)
 
@@ -121,7 +121,7 @@ and to learn some words and culture in the process.`
           return;
         }
 
-        const fromFile = vocabMap[lower] || [];
+        const fromFile = Array.isArray(vocabMap[lower]) ? vocabMap[lower] : [];
         const best = fromFile[0] || "";
         translations[idx] = best;
         confirmed[idx] = false;
@@ -216,13 +216,17 @@ and to learn some words and culture in the process.`
     if (!newOptions.length) return;
 
     setLines((prev) => {
+      if (!Array.isArray(prev) || lineIdx < 0 || lineIdx >= prev.length)
+        return prev;
       const up = [...prev];
       const ln = { ...up[lineIdx] };
-      const tr = [...ln.translations];
-      const cf = [...ln.confirmed];
-      const opts = ln.translationOptions.map((a) => (a ? [...a] : []));
+      const tr = Array.isArray(ln.translations) ? [...ln.translations] : [];
+      const cf = Array.isArray(ln.confirmed) ? [...ln.confirmed] : [];
+      const opts = Array.isArray(ln.translationOptions)
+        ? ln.translationOptions.map((a) => (a ? [...a] : []))
+        : [];
 
-      const merged = [...opts[tokenIdx], ...newOptions];
+      const merged = [...(opts[tokenIdx] || []), ...newOptions];
       const seen = new Set();
       const dedup = merged.filter((o) => {
         const k = (o || "").toLowerCase().trim();
@@ -272,121 +276,123 @@ and to learn some words and culture in the process.`
 
   function safeGetTokenEl(lineIdx, tokenIdx) {
     const key = `${lineIdx}-${tokenIdx}`;
-    const el = tokenRefs.current[key];
+    const el = tokenRefs.current ? tokenRefs.current[key] : null;
     if (!el) return null;
-    // Element könnte durch Re-Render entfernt worden sein
-    if (!document.body.contains(el)) return null;
-    // zusätzlich: muss eine Funktion getBoundingClientRect besitzen
+    if (typeof document !== "undefined" && !document.body.contains(el)) return null;
     if (typeof el.getBoundingClientRect !== "function") return null;
     return el;
   }
 
   function renderTooltip() {
-    const { lineIdx, tokenIdx } = hoverInfo;
-
-    // Nichts aktiv
-    if (lineIdx == null || tokenIdx == null) return null;
-
-    // Zeilen-/Token-Grenzen prüfen
-    if (!Array.isArray(lines) || lineIdx < 0 || lineIdx >= lines.length)
-      return null;
-    const line = lines[lineIdx];
-    if (
-      !line ||
-      !Array.isArray(line.tokens) ||
-      tokenIdx < 0 ||
-      tokenIdx >= line.tokens.length
-    )
-      return null;
-
-    // Satzzeichen? -> Kein Tooltip
-    if (line.tokenMeta?.[tokenIdx]?.isPunct) return null;
-
-    // Ref holen – kann während Re-Render kurzzeitig fehlen
-    const el = safeGetTokenEl(lineIdx, tokenIdx);
-    if (!el) return null;
-
-    // Position defensiv bestimmen
-    let rect;
     try {
-      rect = el.getBoundingClientRect();
-    } catch {
+      const { lineIdx, tokenIdx } = hoverInfo || {};
+      if (lineIdx == null || tokenIdx == null) return null;
+
+      if (!Array.isArray(lines) || lineIdx < 0 || lineIdx >= lines.length)
+        return null;
+      const line = lines[lineIdx];
+      if (
+        !line ||
+        !Array.isArray(line.tokens) ||
+        tokenIdx < 0 ||
+        tokenIdx >= line.tokens.length
+      )
+        return null;
+
+      if (line.tokenMeta?.[tokenIdx]?.isPunct) return null;
+
+      const el = safeGetTokenEl(lineIdx, tokenIdx);
+      if (!el) return null;
+
+      let rect;
+      try {
+        rect = el.getBoundingClientRect();
+      } catch {
+        return null;
+      }
+      const sx = typeof window !== "undefined" ? window.scrollX : 0;
+      const sy = typeof window !== "undefined" ? window.scrollY : 0;
+      const left = (rect?.left || 0) + sx;
+      const top = (rect?.bottom || 0) + sy + 4;
+
+      const w = line.tokens[tokenIdx]?.text || "";
+      const lower = w.toLowerCase();
+
+      const fromState = Array.isArray(line.translationOptions?.[tokenIdx])
+        ? line.translationOptions[tokenIdx]
+        : [];
+      const fromFile = Array.isArray(vocabMap[lower]) ? vocabMap[lower] : [];
+      const current = line.translations?.[tokenIdx] || "";
+
+      let merged = [];
+      if (current) merged.push(current);
+      merged = merged.concat(fromState, fromFile);
+
+      const seen = new Set();
+      merged = merged.filter((o) => {
+        if (!o) return false;
+        const k = o.trim().toLowerCase();
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      if (!merged.length) merged = ["(keine Optionen)"];
+
+      const tip = {
+        position: "absolute",
+        left,
+        top,
+        zIndex: 9999,
+        background: "#fff7d6",
+        border: "1px solid #eab308",
+        borderRadius: "8px",
+        boxShadow: "0 10px 20px rgba(0,0,0,.15)",
+        padding: "8px 10px",
+        fontSize: 14,
+        color: "#1f2937",
+        minWidth: 160,
+        maxWidth: 320,
+        maxHeight: 260,
+        overflowY: "auto",
+      };
+      const item = {
+        cursor: "pointer",
+        padding: "4px 6px",
+        borderRadius: 6,
+        lineHeight: 1.4,
+        fontWeight: 500,
+      };
+
+      return (
+        <div style={tip} onMouseEnter={tipEnter} onMouseLeave={tipLeave}>
+          <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 6 }}>
+            Mouseover für Optionen / <b>Klick</b> = DeepL-Lookup
+          </div>
+          {merged.map((choice, i) => (
+            <div
+              key={i}
+              style={item}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                pick(lineIdx, tokenIdx, choice);
+              }}
+              onMouseOver={(e) => {
+                e.currentTarget.style.background = "#fde68a";
+              }}
+              onMouseOut={(e) => {
+                e.currentTarget.style.background = "transparent";
+              }}
+            >
+              {choice}
+            </div>
+          ))}
+        </div>
+      );
+    } catch (err) {
+      // Let the app live, just log once
+      console.error("Tooltip render error:", err);
       return null;
     }
-    const left = (rect?.left || 0) + window.scrollX;
-    const top = (rect?.bottom || 0) + window.scrollY + 4;
-
-    const w = line.tokens[tokenIdx]?.text || "";
-    const lower = w.toLowerCase();
-    const fromState = Array.isArray(line.translationOptions?.[tokenIdx])
-      ? line.translationOptions[tokenIdx]
-      : [];
-    const fromFile = Array.isArray(vocabMap[lower]) ? vocabMap[lower] : [];
-    const current = line.translations?.[tokenIdx] || "";
-
-    let merged = [];
-    if (current) merged.push(current);
-    merged = merged.concat(fromState, fromFile);
-    const seen = new Set();
-    merged = merged.filter((o) => {
-      if (!o) return false;
-      const k = o.trim().toLowerCase();
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    });
-    if (!merged.length) merged = ["(keine Optionen)"];
-
-    const tip = {
-      position: "absolute",
-      left,
-      top,
-      zIndex: 9999,
-      background: "#fff7d6",
-      border: "1px solid #eab308",
-      borderRadius: "8px",
-      boxShadow: "0 10px 20px rgba(0,0,0,.15)",
-      padding: "8px 10px",
-      fontSize: 14,
-      color: "#1f2937",
-      minWidth: 160,
-      maxWidth: 320,
-      maxHeight: 260,
-      overflowY: "auto",
-    };
-    const item = {
-      cursor: "pointer",
-      padding: "4px 6px",
-      borderRadius: 6,
-      lineHeight: 1.4,
-      fontWeight: 500,
-    };
-
-    return (
-      <div style={tip} onMouseEnter={tipEnter} onMouseLeave={tipLeave}>
-        <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 6 }}>
-          Mouseover für Optionen / <b>Klick</b> = DeepL-Lookup
-        </div>
-        {merged.map((choice, i) => (
-          <div
-            key={i}
-            style={item}
-            onMouseDown={(e) => {
-              e.preventDefault();
-              pick(lineIdx, tokenIdx, choice);
-            }}
-            onMouseOver={(e) => {
-              e.currentTarget.style.background = "#fde68a";
-            }}
-            onMouseOut={(e) => {
-              e.currentTarget.style.background = "transparent";
-            }}
-          >
-            {choice}
-          </div>
-        ))}
-      </div>
-    );
   }
 
   function pick(lineIdx, tokenIdx, choice) {
@@ -570,7 +576,9 @@ and to learn some words and culture in the process.`
                         }}
                       >
                         <span
-                          ref={(el) => (tokenRefs.current[refKey] = el)}
+                          ref={(el) => {
+                            tokenRefs.current[refKey] = el || null;
+                          }}
                           style={eng(isName)}
                           onMouseEnter={() => !isPunctTok && onEnter(li, ti)}
                           onMouseLeave={onLeave}
