@@ -137,60 +137,76 @@ and to learn some words and culture in the process.`
   }
 
   /* ---- Einzelwort: DeepL + Alternativen ---- */
-  async function handleTokenClick(lineIdx, tokenIdx) {
-    const line = lines[lineIdx];
-    if (!line) return;
-    const tok = line.tokens[tokenIdx];
-    if (!tok || isPunctuation(tok.text)) return;
+  /* -------- Einzelwort-DeepL via Klick (bereinigt + Alternativen) -------- */
+async function handleTokenClick(lineIdx, tokenIdx) {
+  const line = lines[lineIdx];
+  if (!line) return;
+  const tok = line.tokens[tokenIdx];
+  if (!tok || isPunctuation(tok.text) || line.tokenMeta?.[tokenIdx]?.isName) return;
 
-    const englishWord = tok.text;
-    const context = line.tokens.map(t => t.text).join(" ");
+  const englishWord = tok.text;
+  const fullLineContext = line.tokens.map(t => t.text).join(" ");
 
-    try {
-      const resp = await fetch(`${API_BASE}/api/translate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phraseText: englishWord, contextText: context }),
-      });
-      const data = await resp.json();
-      const main = (data?.translatedText || "").trim();
-      const alts = Array.isArray(data?.alts) ? data.alts : [];
+  try {
+    const resp = await fetch(`${API_BASE}/api/translate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        phraseText: englishWord,
+        contextText: fullLineContext
+      })
+    });
+    if (!resp.ok) return;
 
-      const newOpts = normalizeOptions([main, ...alts]);
+    const data = await resp.json();
+    // Server liefert bereits gereinigt:
+    //   data.translatedText  (string)
+    //   data.alts            (array, erster ist identisch mit translatedText)
+    const main = (data?.translatedText || "").trim();
+    const alts = Array.isArray(data?.alts) ? data.alts : [];
 
-      if (!newOpts.length) return;
+    if (!main && !alts.length) return;
 
-      // in State übernehmen
-      setLines(prev => {
-        const up = [...prev];
-        const ln = { ...up[lineIdx] };
-        const tr = [...ln.translations];
-        const cf = [...ln.confirmed];
-        const opts = ln.translationOptions.map(a => (a ? [...a] : []));
+    setLines(prev => {
+      const up = [...prev];
+      const ln = { ...up[lineIdx] };
 
-        const merged = normalizeOptions([...opts[tokenIdx], ...newOpts]);
+      const tr = Array.isArray(ln.translations) ? [...ln.translations] : [];
+      const cf = Array.isArray(ln.confirmed) ? [...ln.confirmed] : [];
+      const opts = Array.isArray(ln.translationOptions)
+        ? ln.translationOptions.map(a => (a ? [...a] : []))
+        : [];
 
-        tr[tokenIdx] = newOpts[0];
+      // merge: existierende Optionen + neue Alternativen
+      const merged = [...(opts[tokenIdx] || [])];
+      for (const a of alts) {
+        const k = (a || "").toLowerCase();
+        if (k && !merged.some(m => (m || "").toLowerCase() === k)) {
+          merged.push(a);
+        }
+      }
+
+      // setze Hauptübersetzung
+      if (main) {
+        tr[tokenIdx] = main;
         cf[tokenIdx] = true;
+        // stelle sicher, dass main ganz vorne steht
+        const withoutMain = merged.filter(x => (x || "").toLowerCase() !== main.toLowerCase());
+        opts[tokenIdx] = [main, ...withoutMain];
+      } else {
         opts[tokenIdx] = merged;
+      }
 
-        ln.translations = tr;
-        ln.confirmed = cf;
-        ln.translationOptions = opts;
-        up[lineIdx] = ln;
-        return up;
-      });
-
-      // optional: Auswahl als Vokabel speichern (nur Hauptkandidat)
-      fetch(`${API_BASE}/api/vocab/save`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ eng: englishWord.toLowerCase(), ger: newOpts[0] }),
-      }).catch(() => {});
-    } catch (e) {
-      console.warn("DeepL single-word failed:", e);
-    }
+      ln.translations = tr;
+      ln.confirmed = cf;
+      ln.translationOptions = opts;
+      up[lineIdx] = ln;
+      return up;
+    });
+  } catch (e) {
+    console.warn('DeepL click failed:', e);
   }
+}
 
   /* ---- Tooltip ---- */
   function scheduleHide() {
