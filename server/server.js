@@ -14,23 +14,24 @@ app.use(express.json());
 const DEEPL_URL = process.env.DEEPL_URL || 'https://api-free.deepl.com/v2/translate';
 const DEEPL_KEY = process.env.DEEPL_KEY;
 
+// Debug-Schalter
+const DEBUG = process.env.DEBUG_DEEPL === '1';
+
 const MONTHS = [
-  'Januar','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'
+  'Januar','Februar','März','April','Mai','Juni','Juli','August',
+  'September','Oktober','November','Dezember'
 ];
 
 function looksBad(s) {
   if (!s) return true;
   const t = s.trim();
 
-  // Prompt-Echos und Meta
   if (/^\s*(übersetze|translate)\b/i.test(t)) return true;
 
-  // Verhindere Datum/Monat-Artefakte & Zahlen
   if (/\d/.test(t)) return true;
   const monthRe = new RegExp(`\\b(${MONTHS.join('|')})\\b`, 'i');
   if (monthRe.test(t)) return true;
 
-  // Nur “normale” Zeichen (Deutsch/Leerzeichen/Bindestrich)
   if (!/^[A-Za-zÄÖÜäöüß \-]+$/.test(t)) return true;
 
   return false;
@@ -38,9 +39,7 @@ function looksBad(s) {
 
 function cleanOne(s) {
   if (!s) return '';
-  // erste Zeile / vor erstem Satzende
   let t = s.split(/[\r\n]/)[0].split(/[.!?;:]/)[0].trim();
-  // höchstens 3 Wörter
   t = t.split(/\s+/).slice(0, 3).join(' ').trim();
   if (!t) return '';
   if (looksBad(t)) return '';
@@ -70,19 +69,32 @@ async function deeplTranslateOnce(text, extraParams = {}) {
     preserve_formatting: '1',
     ...extraParams
   });
+
   const r = await fetch(DEEPL_URL, { method: 'POST', body: params });
   const data = await r.json().catch(() => ({}));
+
+  if (DEBUG) {
+    console.log('--- DeepL raw response ---');
+    console.log(JSON.stringify(data, null, 2));
+    console.log('---------------------------');
+  }
+
   const raw = data?.translations?.[0]?.text || '';
   return raw;
 }
 
 async function deeplWordWithAlts(phrase, contextLine) {
-  // Wir sammeln mehrere Versuche (original, lowercased, formality)
+  if (DEBUG) {
+    console.log(`\n===== DeepL WORD LOOKUP =====`);
+    console.log(`Phrase: "${phrase}"`);
+    console.log(`Context: "${contextLine}"`);
+  }
+
   const jobs = [
     { t: phrase, p: {} },
     { t: phrase.toLowerCase(), p: {} },
     { t: phrase, p: { formality: 'more' } },
-    { t: phrase, p: { formality: 'less' } },
+    { t: phrase, p: { formality: 'less' } }
   ];
 
   const rawCandidates = [];
@@ -90,19 +102,28 @@ async function deeplWordWithAlts(phrase, contextLine) {
     try {
       const raw = await deeplTranslateOnce(j.t, j.p);
       if (raw) rawCandidates.push(raw);
+
+      if (DEBUG) {
+        console.log(`Candidate from "${j.t}" (${JSON.stringify(j.p)}): "${raw}"`);
+      }
     } catch (e) {
-      console.warn('DeepL call failed:', e.message);
+      if (DEBUG) console.log('DeepL call failed:', e.message);
     }
   }
 
-  // Säubern
-  const cleaned = rawCandidates
-    .map(cleanOne)
-    .filter(Boolean);
+  if (DEBUG) {
+    console.log('Raw candidates before clean:', rawCandidates);
+  }
 
+  const cleaned = rawCandidates.map(cleanOne).filter(Boolean);
   const unique = dedupKeepOrder(cleaned);
 
-  // Erste ist Hauptübersetzung
+  if (DEBUG) {
+    console.log('Cleaned candidates:', cleaned);
+    console.log('Unique final candidates:', unique);
+    console.log('=============================\n');
+  }
+
   return {
     translatedText: unique[0] || '',
     alts: unique
@@ -119,6 +140,7 @@ app.post('/api/translate', async (req, res) => {
     if (!phraseText || !phraseText.trim()) {
       return res.status(400).json({ error: 'phraseText missing' });
     }
+
     const result = await deeplWordWithAlts(phraseText.trim(), contextText || '');
     return res.json(result);
   } catch (e) {
@@ -133,8 +155,20 @@ app.post('/api/translate/fulltext', async (req, res) => {
     if (!fullText || !fullText.trim()) {
       return res.json({ translatedText: '' });
     }
+
+    if (DEBUG) {
+      console.log('\n===== DeepL FULLTEXT =====');
+      console.log(fullText);
+    }
+
     const raw = await deeplTranslateOnce(fullText.trim(), { split_sentences: '1' });
     const cleaned = (raw || '').replace(/\s+/g, ' ').trim();
+
+    if (DEBUG) {
+      console.log('Fulltext cleaned:', cleaned);
+      console.log('==========================\n');
+    }
+
     return res.json({ translatedText: cleaned });
   } catch (e) {
     console.error('/api/translate/fulltext error:', e);
@@ -142,7 +176,7 @@ app.post('/api/translate/fulltext', async (req, res) => {
   }
 });
 
-// ---------- Static client (Vite build) ----------
+// ---------- Static client ----------
 const path = require('path');
 const clientBuildPath = path.join(__dirname, '..', 'client', 'dist');
 
