@@ -6,117 +6,169 @@ const cors = require("cors");
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 const { Pool } = require("pg");
 
-const app = express();
-const PORT = process.env.PORT || 3001;
-
-// erlaubt Frontend von gleicher Origin (Render)
-app.use(cors({ origin: process.env.ALLOW_ORIGIN || "*" }));
-app.use(express.json());
-
-// ---------- DB (optional für spätere Speicherung) ----------
-let pool = null;
-if (process.env.DATABASE_URL) {
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DB_SSL ? { rejectUnauthorized: false } : undefined,
-  });
-}
-
-// ---------- DeepL Helper ----------
+// --- Konfiguration ---
+const PORT = process.env.PORT || 10000;
+const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "*";
 const DEEPL_URL = process.env.DEEPL_URL || "https://api-free.deepl.com/v2/translate";
-const DEEPL_KEY = process.env.DEEPL_KEY;
+const DEEPL_KEY = process.env.DEEPL_KEY || "";
+const DATABASE_URL = process.env.DATABASE_URL || "";
 
-async function deeplTranslate(params) {
-  if (!DEEPL_KEY) throw new Error("DEEPL_KEY missing");
-  const body = new URLSearchParams({ auth_key: DEEPL_KEY });
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null) body.append(k, String(v));
-  }
-  const r = await fetch(DEEPL_URL, { method: "POST", body });
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`DeepL ${r.status}: ${txt}`);
-  }
-  return r.json();
+// --- App & Middleware ---
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+app.use(cors({ origin: ALLOW_ORIGIN }));
+
+// --- Postgres Pool (optional: nur wenn URL gesetzt) ---
+let pgPool = null;
+if (DATABASE_URL) {
+  pgPool = new Pool({ connectionString: DATABASE_URL, max: 3 });
 }
 
-function uniqStrings(arr) {
-  const s = new Set();
-  const out = [];
-  for (const x of arr) {
-    const k = String(x || "").trim().toLowerCase();
-    if (!k || s.has(k)) continue;
-    s.add(k);
-    out.push(String(x).trim());
+// Hilfsfunktion: DeepL call
+async function deeplTranslate(text, opts = {}) {
+  if (!DEEPL_KEY) return { ok: false, text: "", alts: [] };
+
+  const params = new URLSearchParams();
+  params.set("auth_key", DEEPL_KEY);
+  params.set("text", text);
+  params.set("source_lang", opts.source_lang || "EN");
+  params.set("target_lang", opts.target_lang || "DE");
+  if (opts.formality) params.set("formality", opts.formality); // prefer_less / prefer_more
+  if (opts.split_sentences != null) params.set("split_sentences", String(opts.split_sentences));
+
+  const r = await fetch(DEEPL_URL, { method: "POST", body: params });
+  const j = await r.json().catch(() => ({}));
+
+  const t =
+    j?.translations?.[0]?.text?.trim?.() ||
+    "";
+
+  // Falls DeepL „alternatives“ unterstützt (manche Accounts), übernehmen
+  let alts = [];
+  const rawAlts = j?.translations?.[0]?.alternatives || j?.alternatives || [];
+  if (Array.isArray(rawAlts)) {
+    alts = rawAlts
+      .map((a) => (typeof a === "string" ? a : a?.text))
+      .filter(Boolean)
+      .map((s) => s.trim());
   }
-  return out;
+  return { ok: true, text: t, alts };
 }
 
-// ---------- Routes ----------
-app.get("/health", (_req, res) => res.send("ok"));
+// Heuristik: Alternativen erzwingen (wenn API keine „alternatives“ liefert)
+async function collectAlternatives(englishWord, contextLine) {
+  const out = new Set();
 
-// Volltext (Kontext) – bleibt wie gehabt
+  // 1) Standard
+  const a1 = await deeplTranslate(englishWord, { source_lang: "EN", target_lang: "DE" });
+  if (a1.text) out.add(a1.text);
+  (a1.alts || []).forEach((x) => out.add(x));
+
+  // 2) Kleinschreibung
+  const lower = englishWord.toLowerCase();
+  if (lower !== englishWord) {
+    const a2 = await deeplTranslate(lower, { source_lang: "EN", target_lang: "DE" });
+    if (a2.text) out.add(a2.text);
+    (a2.alts || []).forEach((x) => out.add(x));
+  }
+
+  // 3) mit Kontext (ganze Zeile)
+  if (contextLine) {
+    const a3 = await deeplTranslate(contextLine, { source_lang: "EN", target_lang: "DE" });
+    if (a3.text) {
+      // nimm das „beste“ einzelne Wort/kurze Phrase aus dem Satz (1–3 Wörter)
+      const first = a3.text.split(/[\r\n]/)[0].split(/[.;!?]/)[0].trim();
+      const parts = first.split(/\s+/).slice(0, 3).join(" ").trim();
+      if (parts) out.add(parts);
+    }
+  }
+
+  // 4) Formalitäts-Varianten
+  const a4 = await deeplTranslate(englishWord, { source_lang: "EN", target_lang: "DE", formality: "prefer_less" });
+  if (a4.text) out.add(a4.text);
+  const a5 = await deeplTranslate(englishWord, { source_lang: "EN", target_lang: "DE", formality: "prefer_more" });
+  if (a5.text) out.add(a5.text);
+
+  // Nach Länge/Einfachheit sortieren (kürzer zuerst), dann alphabetisch
+  const arr = [...out]
+    .map((s) => s.trim())
+    .filter((s) => s && !/^übersetze möglichst|^translate/i.test(s));
+  arr.sort((a, b) => (a.split(/\s+/).length - b.split(/\s+/).length) || a.localeCompare(b, "de"));
+
+  // Top 12 reichen locker
+  return arr.slice(0, 12);
+}
+
+// --- API: Health ---
+app.get("/health", (req, res) => res.send("ok"));
+
+// --- API: Volltext (für Kontextanzeige) ---
 app.post("/api/translate/fulltext", async (req, res) => {
   try {
-    const fullText = String(req.body?.fullText || "");
-    const json = await deeplTranslate({
-      text: fullText,
-      source_lang: "EN",
-      target_lang: "DE",
-      split_sentences: "1",
-      preserve_formatting: "1",
-    });
-    const out = json?.translations?.[0]?.text || "";
-    res.json({ translatedText: out });
+    const fullText = (req.body?.fullText || "").toString();
+    const r = await deeplTranslate(fullText, { source_lang: "EN", target_lang: "DE", split_sentences: 1 });
+    return res.json({ translatedText: r.text || "" });
   } catch (e) {
     console.error("/api/translate/fulltext error:", e);
-    res.status(500).json({ error: "fulltext failed" });
+    return res.status(500).json({ error: "fulltext failed" });
   }
 });
 
-// Einzelwort mit Alternativen
-app.post("/api/translate_word", async (req, res) => {
+// --- API: Einzelwort mit Alternativen ---
+app.post("/api/translate", async (req, res) => {
   try {
-    const word = String(req.body?.word || "").trim();
-    if (!word) return res.json({ options: [] });
+    const phraseText = (req.body?.phraseText || "").toString().trim();
+    const contextText = (req.body?.contextText || "").toString();
+    if (!phraseText) return res.json({ translatedText: "", alts: [] });
 
-    // zwei Varianten probieren: Original & lowercase
-    const variants = uniqStrings([word, word.toLowerCase()]);
+    // Erstübersetzung (Hauptkandidat)
+    const first = await deeplTranslate(phraseText, { source_lang: "EN", target_lang: "DE" });
+    let main = first.text || "";
+    if (/^übersetze möglichst|^translate/i.test(main)) main = ""; // Sicherheit
 
-    let options = [];
-    for (const v of variants) {
-      const json = await deeplTranslate({
-        text: v,
-        source_lang: "EN",
-        target_lang: "DE",
-        // liefert bis zu 3 Alternativen (falls verfügbar)
-        alternatives: "3",
-        split_sentences: "1",
-        preserve_formatting: "1",
-      });
+    // Alternativen einsammeln
+    const alts = await collectAlternatives(phraseText, contextText);
 
-      const main = json?.translations?.[0]?.text ? [json.translations[0].text] : [];
-      const alts =
-        json?.translations?.[0]?.alternatives?.map((a) => a?.text).filter(Boolean) || [];
-      options = options.concat(main, alts);
-    }
+    // Falls „main“ leer ist, nimm erste Alternative
+    if (!main && alts.length) main = alts[0];
 
-    // aufräumen: kurz halten, doppelte raus
-    options = uniqStrings(options).slice(0, 8);
-
-    res.json({ options });
+    return res.json({ translatedText: main, alts });
   } catch (e) {
-    console.error("/api/translate_word error:", e);
-    res.status(500).json({ error: "word translate failed" });
+    console.error("/api/translate error:", e);
+    return res.status(500).json({ error: "translate failed" });
   }
 });
 
-// ---------- Static React Build ausliefern ----------
-const path = require("path");
-const clientBuildPath = path.join(__dirname, "..", "client", "dist");
-app.use(express.static(clientBuildPath));
-app.get("*", (_req, res) => {
-  res.sendFile(path.join(clientBuildPath, "index.html"));
+// --- API: Vokabel speichern (optional, wenn DB konfiguriert) ---
+// body: { eng: "oversee", ger: "überwachen" }
+app.post("/api/vocab/save", async (req, res) => {
+  try {
+    if (!pgPool) return res.json({ ok: true }); // no-op ohne DB
+    const eng = (req.body?.eng || "").toString().trim().toLowerCase();
+    const ger = (req.body?.ger || "").toString().trim();
+    if (!eng || !ger) return res.json({ ok: true });
+
+    // Tabelle: vocab(eng text, ger text, priority int default 0, cnt int default 0, PRIMARY KEY(eng, ger))
+    await pgPool.query(
+      `
+      INSERT INTO vocab (eng, ger, priority, cnt)
+      VALUES ($1, $2, 0, 1)
+      ON CONFLICT (eng, ger) DO UPDATE
+      SET cnt = vocab.cnt + 1;
+      `,
+      [eng, ger]
+    );
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("/api/vocab/save error:", e);
+    return res.status(500).json({ ok: false });
+  }
 });
+
+// --- Static React ausliefern ---
+const path = require("path");
+const clientBuild = path.join(__dirname, "..", "client", "dist");
+app.use(express.static(clientBuild));
+app.get("*", (req, res) => res.sendFile(path.join(clientBuild, "index.html")));
 
 app.listen(PORT, () => console.log("Server listening on", PORT));
