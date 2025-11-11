@@ -16,6 +16,9 @@ export default function App() {
 while slowly going a bit mad. Will they make it to their destination before sunset? Listen to find out what happens
 and to learn some words and culture in the process.`
   );
+  
+  // ganz oben in App() neben deinen anderen Refs/States:
+  const dbCacheRef = useRef(Object.create(null)); // { [engLower]: [ {ger, priority, cnt}, ... ] }
 
   const [lines, setLines] = useState([]);
   const [fullGermanText, setFullGermanText] = useState("");
@@ -106,6 +109,25 @@ and to learn some words and culture in the process.`
     setLines(draft);
   }
 
+  async function fetchDBSuggestions(engLower) {
+  if (!engLower) return [];
+  // Cache-Hit?
+  if (dbCacheRef.current[engLower]) return dbCacheRef.current[engLower];
+
+  try {
+    const resp = await fetch(`${API_BASE}/api/vocab/list?eng=${encodeURIComponent(engLower)}`);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    // Erwartetes Format: { items: [ { ger: "…", priority: 3, cnt: 12 }, ... ] }
+    const items = Array.isArray(data?.items) ? data.items : [];
+    dbCacheRef.current[engLower] = items;
+    return items;
+  } catch {
+    return [];
+  }
+}
+
+
   /* ------ Volltextbutton ------ */
   async function handleFullTextTranslate() {
     try {
@@ -155,55 +177,127 @@ const onEnter = (li, ti) => { cancelHide(); setHoverInfo({ lineIdx: li, tokenIdx
   
   /* ------ Klick auf ein Wort: Einzelwort ohne Kontext ------ */
   async function handleTokenClick(lineIdx, tokenIdx) {
-    const line = lines[lineIdx];
-    if (!line) return;
-    const tok = line.tokens[tokenIdx];
-    if (!tok || line.tokenMeta[tokenIdx]?.isPunct) return;
+  const ln = lines[lineIdx];
+  if (!ln) return;
+  const tok = ln.tokens?.[tokenIdx];
+  if (!tok) return;
 
-    const englishWord = tok.text;
+  const word = String(tok.text || "");
+  // Satzzeichen / Namen ignorieren
+  if (!word || ln.tokenMeta?.[tokenIdx]?.isPunct || ln.tokenMeta?.[tokenIdx]?.isName) return;
 
-    try {
-      const resp = await fetch(`${API_BASE}/api/translate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phraseText: englishWord }),
-      });
-      const data = await resp.json();
-      const core = (data?.translatedText || "").trim();
-      const alts = Array.isArray(data?.alts) ? data.alts : [];
+  const engLower = word.toLowerCase();
+  const variants = [word, engLower, word[0]?.toUpperCase() + word.slice(1).toLowerCase()];
 
-      if (!core && !alts.length) return;
+  // 1) Parallel DeepL (ohne Kontext) für mehrere Varianten abfragen
+  const deepLCalls = variants.map(v =>
+    fetch(`${API_BASE}/api/translate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // WICHTIG: kein Kontext mitsenden -> reine Wortsuche
+      body: JSON.stringify({ phraseText: v, noContext: true, wantAlternatives: true })
+      // Server sollte { translatedText: "…", alts: ["…","…"] } liefern
+    }).then(r => r.ok ? r.json() : null).catch(() => null)
+  );
 
-      setLines((prev) => {
-        const up = [...prev];
-        const ln = { ...up[lineIdx] };
-        const tr = [...ln.translations];
-        const cf = [...ln.confirmed];
-        const opts = ln.translationOptions.map((a) => (a ? [...a] : []));
+  // 2) DB-Vorschläge parallel laden (lazy, mit Cache)
+  const dbCall = fetchDBSuggestions(engLower);
 
-        const merged = [core, ...alts, ...opts[tokenIdx]].filter(Boolean);
-        const seen = new Set();
-        const dedup = merged.filter((o) => {
-          const k = o.toLowerCase();
-          if (seen.has(k)) return false;
-          seen.add(k);
-          return true;
-        });
+  const results = await Promise.allSettled([...deepLCalls, dbCall]);
 
-        tr[tokenIdx] = core || dedup[0] || "";
-        cf[tokenIdx] = true;
-        opts[tokenIdx] = dedup;
+  // letztes Resultat ist die DB-Liste (wegen [...deepLCalls, dbCall])
+  const dbItems = results.pop()?.value || [];
+  // dbItems: [ {ger, priority, cnt}, ... ]
 
-        ln.translations = tr;
-        ln.confirmed = cf;
-        ln.translationOptions = opts;
-        up[lineIdx] = ln;
-        return up;
-      });
-    } catch (e) {
-      console.warn("word translate failed", e);
+  // DeepL-Ergebnisse einsammeln
+  const deeplPairs = [];
+  for (const r of results) {
+    if (r.status !== "fulfilled" || !r.value) continue;
+    const t = r.value;
+    // Wir nehmen Hauptübersetzung + Alternativen
+    const raw = []
+      .concat(t?.translatedText ? [t.translatedText] : [])
+      .concat(Array.isArray(t?.alts) ? t.alts : []);
+
+    for (let s of raw) {
+      s = String(s || "").trim();
+      if (!s) continue;
+
+      // Heuristik: offensichtliches Rauschen (z. B. "Januar 2027 :" etc.) filtern
+      // Erlaubt sinnvolle Wörter/Phrasen bis max. 3 Token
+      const cleaned = s.split(/[\r\n]/)[0].split(/[.;!?]/)[0].trim();
+      const parts = cleaned.split(/\s+/).filter(Boolean).slice(0, 3);
+      const candidate = parts.join(" ");
+      // mind. 1 Buchstabe; keine reinen Zahl-/Datums-Fragmente
+      if (!/[A-Za-zÄÖÜäöüß]/.test(candidate)) continue;
+
+      deeplPairs.push(candidate);
     }
   }
+
+  // DB zu einfacher Liste + Prioritäts-Map machen
+  const dbList = [];
+  const pri = Object.create(null); // pri["ger"] = weight
+  for (const it of dbItems) {
+    const g = String(it?.ger || "").trim();
+    if (!g) continue;
+    dbList.push(g);
+    // Gewichtung: priority wichtiger als cnt
+    const w = (Number(it?.priority) || 0) * 1000 + (Number(it?.cnt) || 0);
+    pri[g.toLowerCase()] = w;
+  }
+
+  // vorhandene Optionen aus State (falls schon etwas da war)
+  const currentOpts = Array.isArray(ln.translationOptions?.[tokenIdx])
+    ? ln.translationOptions[tokenIdx]
+    : [];
+
+  // 3) Alles zusammenführen und deduplizieren
+  const merged = []
+    .concat(currentOpts, dbList, deeplPairs)
+    .map(s => String(s || "").trim())
+    .filter(Boolean);
+
+  const seen = new Set();
+  const dedup = merged.filter(s => {
+    const k = s.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  // 4) Sortierung: DB-Priorität (absteigend) → Alphabet
+  dedup.sort((a, b) => {
+    const aw = pri[a.toLowerCase()] || 0;
+    const bw = pri[b.toLowerCase()] || 0;
+    if (bw !== aw) return bw - aw;
+    return a.localeCompare(b, "de");
+  });
+
+  // 5) Ersten Treffer übernehmen, Optionen in State schreiben
+  const first = dedup[0] || "";
+
+  setLines(prev => {
+    const cp = [...prev];
+    const line = { ...cp[lineIdx] };
+    const tr = Array.isArray(line.translations) ? [...line.translations] : [];
+    const cf = Array.isArray(line.confirmed) ? [...line.confirmed] : [];
+    const opts = Array.isArray(line.translationOptions)
+      ? line.translationOptions.map(a => (a ? [...a] : []))
+      : [];
+
+    tr[tokenIdx] = first;
+    cf[tokenIdx] = !!first;
+    opts[tokenIdx] = dedup;
+
+    line.translations = tr;
+    line.confirmed = cf;
+    line.translationOptions = opts;
+    cp[lineIdx] = line;
+    return cp;
+  });
+}
+
   
 const API_BASE = ""; // same origin
 
