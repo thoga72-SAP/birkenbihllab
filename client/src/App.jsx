@@ -124,6 +124,35 @@ and to learn some words and culture in the process.`
     }
   }
 
+async function loadDbOptions(li, ti) {
+  const w = lines?.[li]?.tokens?.[ti]?.text || "";
+  if (!w) return;
+  try {
+    const r = await fetch(`${API_BASE}/api/vocab/options?eng=${encodeURIComponent(w.toLowerCase())}`);
+    const j = await r.json();
+    const fromDb = (j?.options || []).map(o => o.ger);
+    if (!fromDb.length) return;
+
+    setLines(prev => {
+      const up = [...prev];
+      const ln = { ...up[li] };
+      const opts = ln.translationOptions.map(a => (a ? [...a] : []));
+      const merged = [...fromDb, ...opts[ti]];
+      const seen = new Set();
+      opts[ti] = merged.filter(x => {
+        const k = (x || '').toLowerCase().trim();
+        if (!k || seen.has(k)) return false;
+        seen.add(k); return true;
+      });
+      ln.translationOptions = opts; up[li] = ln; return up;
+    });
+  } catch {}
+}
+
+// beim Hovern zusätzlich laden:
+const onEnter = (li, ti) => { cancelHide(); setHoverInfo({ lineIdx: li, tokenIdx: ti, overTooltip: false }); loadDbOptions(li, ti); };
+
+  
   /* ------ Klick auf ein Wort: Einzelwort ohne Kontext ------ */
   async function handleTokenClick(lineIdx, tokenIdx) {
     const line = lines[lineIdx];
@@ -175,6 +204,21 @@ and to learn some words and culture in the process.`
       console.warn("word translate failed", e);
     }
   }
+  
+const API_BASE = ""; // same origin
+
+async function saveVocab(eng, ger, delta = 1) {
+  try {
+    await fetch(`${API_BASE}/api/vocab/save`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ eng: eng.toLowerCase(), ger, delta })
+    });
+  } catch (e) {
+    console.warn("saveVocab failed", e);
+  }
+}
+
 
   /* ------ Tooltip ------ */
   function scheduleHide() {
@@ -190,27 +234,29 @@ and to learn some words and culture in the process.`
   const tipEnter = () => { cancelHide(); setHoverInfo((p) => ({ ...p, overTooltip: true })); };
   const tipLeave = () => scheduleHide();
 
-  function pick(lineIdx, tokenIdx, choice) {
-    if (!choice || choice === "(keine Optionen)") return;
-    if (choice === "__MANUAL__") {
-      const t = prompt("Eigene Übersetzung eingeben:");
-      if (!t) return;
-      return pick(lineIdx, tokenIdx, t.trim());
-    }
-    setLines((prev) => {
-      const up = [...prev];
-      const line = { ...up[lineIdx] };
-      const tr = [...line.translations];
-      const cf = [...line.confirmed];
-      const opts = line.translationOptions.map((a) => (a ? [...a] : []));
-      tr[tokenIdx] = choice;
-      cf[tokenIdx] = true;
-      opts[tokenIdx] = [choice, ...opts[tokenIdx].filter((o) => o !== choice)];
-      line.translations = tr; line.confirmed = cf; line.translationOptions = opts;
-      up[lineIdx] = line; return up;
-    });
-    setHoverInfo({ lineIdx: null, tokenIdx: null, overTooltip: false });
-  }
+function pick(lineIdx, tokenIdx, choice) {
+  if (!choice || choice === "(keine Optionen)") return;
+
+  const engWord = lines?.[lineIdx]?.tokens?.[tokenIdx]?.text || "";
+  // State aktualisieren (wie bisher) ...
+  setLines(prev => {
+    const up = [...prev];
+    const line = { ...up[lineIdx] };
+    const tr = [...line.translations];
+    const cf = [...line.confirmed];
+    const opts = line.translationOptions.map(a => (a ? [...a] : []));
+    tr[tokenIdx] = choice; cf[tokenIdx] = true;
+    opts[tokenIdx] = [choice, ...opts[tokenIdx].filter(o => o !== choice)];
+    line.translations = tr; line.confirmed = cf; line.translationOptions = opts;
+    up[lineIdx] = line; return up;
+  });
+
+  // >>> neu: Auswahl in DB hochzählen
+  if (engWord && choice) saveVocab(engWord, choice, 1);
+
+  setHoverInfo({ lineIdx: null, tokenIdx: null, overTooltip: false });
+}
+
 
   function renderTooltip() {
     const { lineIdx, tokenIdx } = hoverInfo;
