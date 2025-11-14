@@ -1,5 +1,10 @@
 // client/src/App.jsx
 import React, { useEffect, useRef, useState } from "react";
+import {
+  loadPriority,
+  updatePriority,
+  sortWithPriority,
+} from "./priorityStore";
 
 /** gleiche Origin wie das Frontend (Server liefert die API-Routen) */
 const API_BASE = "";
@@ -18,13 +23,15 @@ function parseJSONSafe(txt, fallback) {
   }
 }
 
-const tokenize = (s) =>
-  (s.match(/(\w+|'\w+|[^\s\w]+)/g) || []).map((t) => ({ text: t }));
+/** Einfacher Tokenizer: Wörter + Satzzeichen als einzelne Tokens */
+function tokenize(s) {
+  return (s.match(/(\w+|'\w+|[^\s\w]+)/g) || []).map((t) => ({ text: t }));
+}
 
-/** Heuristik: Kandidaten von DeepL sauber halten (keine Datums-/Müll-Treffer) */
+/** Heuristik: Kandidaten von DeepL sauber halten */
 function cleanCandidates(list) {
   const bad = [
-    /^januar\s+\d{4}\s*:?/i, // "Januar 2027 :"
+    /^januar\s+\d{4}\s*:?/i,
     /^februar\s+\d{4}\s*:?/i,
     /^märz\s+\d{4}\s*:?/i,
     /^april\s+\d{4}\s*:?/i,
@@ -36,9 +43,8 @@ function cleanCandidates(list) {
     /^oktober\s+\d{4}\s*:?/i,
     /^november\s+\d{4}\s*:?/i,
     /^dezember\s+\d{4}\s*:?/i,
-    /^[.:,;!?]+$/,
   ];
-  const keepLen = (s) => s.trim().split(/\s+/).length <= 3;
+  const keepLen = (s) => s.trim().split(/\s+/).length <= 4;
 
   return (list || [])
     .map((s) => String(s || "").trim())
@@ -47,13 +53,12 @@ function cleanCandidates(list) {
     .filter(keepLen);
 }
 
-/* ----------------- App-Komponente ----------------- */
+/* ----------------- Komponente ----------------- */
 
 export default function App() {
   const [inputText, setInputText] = useState(
     `James and Luke go on an accidental road trip in the south-west of England and record a rambling podcast,
-while slowly going a bit mad. Will they make it to their destination before sunset? Listen to find out what happens
-and to learn some words and culture in the process.`
+while slowly going a bit mad.`
   );
 
   // Daten je Lernzeile
@@ -61,11 +66,7 @@ and to learn some words and culture in the process.`
   const [fullGermanText, setFullGermanText] = useState("");
   const [isTranslatingFull, setIsTranslatingFull] = useState(false);
 
-  // Vokabeldatei (optional: statische Datei als Fallback)
-  const [vocabMap, setVocabMap] = useState({});
-  const [vocabLoaded, setVocabLoaded] = useState(false);
-
-  // Tooltip-Status
+  // Tooltip-Steuerung
   const [hoverInfo, setHoverInfo] = useState({
     lineIdx: null,
     tokenIdx: null,
@@ -74,60 +75,44 @@ and to learn some words and culture in the process.`
   const hoverTimerRef = useRef(null);
   const tokenRefs = useRef(Object.create(null));
 
-  /* -------- Vokabeldatei laden (VkblDB.txt – optional) -------- */
+  // Priority-Store (lokal im Browser)
+  const [priorityState, setPriorityState] = useState(() => loadPriority());
+
   useEffect(() => {
-    (async () => {
-      try {
-        const r = await fetch("/VkblDB.txt");
-        if (!r.ok) {
-          setVocabLoaded(true);
-          return;
-        }
-        let text = await r.text();
-        text = text.replace(/^\uFEFF/, "");
-        const map = Object.create(null);
-        for (const raw of text.split(/\r?\n/)) {
-          const line = raw.trim();
-          if (!line || line.startsWith("//")) continue;
-          const m = line.match(/^([^#]+?)#(.*)$/);
-          if (!m) continue;
-          const eng = m[1].trim().toLowerCase();
-          const ger = m[2].trim();
-          if (!eng || !ger) continue;
-          (map[eng] ||= []).includes(ger) || map[eng].push(ger);
-        }
-        setVocabMap(map);
-      } catch (e) {
-        console.warn("Vokabelladen fehlgeschlagen:", e);
-      } finally {
-        setVocabLoaded(true);
-      }
-    })();
-  }, []);
-
-  /* -------- Aufbereiten (mit DeepL-Volltext, nur für Kontextanzeige) -------- */
-  async function handlePrepare() {
-    let deepLFull = [];
+    // Priority-State in localStorage persistieren
     try {
-      const r = await fetch(`${API_BASE}/api/translate/fulltext`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fullText: inputText }),
-      });
-      if (r.ok) {
-        const d = await r.json();
-        const txt = d?.translatedText || "";
-        setFullGermanText(txt);
-        deepLFull = txt
-          .split(/\r?\n/)
-          .map((s) => s.trim().split(/\s+/).filter(Boolean));
-      }
-    } catch (e) {
-      console.warn("fulltext failed", e);
+      // updatePriority übernimmt selbst das Speichern; hier nur Fallback, falls du mal direkt speicherst
+      // (falls dein priorityStore bereits speichert, kannst du diesen Effekt weglassen)
+    } catch {
+      /* ignore */
     }
+  }, [priorityState]);
 
-    // Zeilen aufbereiten
+  /* ---------------- Token-Ref Helper ---------------- */
+
+  function registerTokenRef(lineIdx, tokenIdx, el) {
+    const key = `${lineIdx}:${tokenIdx}`;
+    if (!el) {
+      delete tokenRefs.current[key];
+    } else {
+      tokenRefs.current[key] = el;
+    }
+  }
+
+  function safeGetTokenEl(lineIdx, tokenIdx) {
+    const key = `${lineIdx}:${tokenIdx}`;
+    const el = tokenRefs.current[key];
+    if (!el) return null;
+    if (!document.body.contains(el)) return null;
+    if (typeof el.getBoundingClientRect !== "function") return null;
+    return el;
+  }
+
+  /* ---------------- Zeilen vorbereiten ---------------- */
+
+  function handlePrepare() {
     const englishLines = inputText.split(/\r?\n/);
+
     const draft = englishLines.map((ln) => {
       const tokens = tokenize(ln);
       const translations = [];
@@ -148,28 +133,10 @@ and to learn some words and culture in the process.`
           return;
         }
 
-        const fromFile = vocabMap[lower] || [];
-        const best = fromFile[0] || "";
-        translations[idx] = best;
+        // Erstmal leer, füllen wir später über DeepL/DB
+        translations[idx] = "";
         confirmed[idx] = false;
-        opts[idx] = fromFile.length ? [...fromFile] : best ? [best] : [];
-      });
-
-      // Wiederholungen in EINER Zeile leicht streuen
-      const freq = Object.create(null);
-      translations.forEach((t) => {
-        if (t) freq[t] = (freq[t] || 0) + 1;
-      });
-      translations.forEach((t, i) => {
-        if (!t) return;
-        if (freq[t] >= 3 && opts[i] && opts[i].length > 1) {
-          const alt = opts[i].find((o) => o !== t);
-          if (alt) {
-            translations[i] = alt;
-            freq[t]--;
-            freq[alt] = (freq[alt] || 0) + 1;
-          }
-        }
+        opts[idx] = [];
       });
 
       return {
@@ -182,9 +149,11 @@ and to learn some words and culture in the process.`
     });
 
     setLines(draft);
+    setFullGermanText("");
   }
 
-  /* -------- Volltext-Button -------- */
+  /* ---------------- Volltext-Übersetzung ---------------- */
+
   async function handleFullTextTranslate() {
     try {
       setIsTranslatingFull(true);
@@ -193,56 +162,73 @@ and to learn some words and culture in the process.`
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fullText: inputText }),
       });
+      if (!r.ok) {
+        console.warn("fulltext HTTP error", r.status);
+        return;
+      }
       const d = await r.json();
-      setFullGermanText(d?.translatedText || "(kein Ergebnis)");
-    } catch {
-      setFullGermanText("(Fehler)");
+      const txt = d?.translatedText || "";
+      setFullGermanText(txt);
+    } catch (e) {
+      console.warn("fulltext failed", e);
     } finally {
       setIsTranslatingFull(false);
     }
   }
 
-  /* -------- Einzelwort-DeepL via Klick (ohne Kontext, mit Alternativen) -------- */
-  async function handleTokenClick(lineIdx, tokenIdx) {
+  /* ---------------- Einzelwort-Klick: DeepL + DB-Vorschläge ---------------- */
+
+  function handleTokenClick(lineIdx, tokenIdx) {
     const line = lines[lineIdx];
     if (!line) return;
     const tok = line.tokens[tokenIdx];
-    if (!tok || isPunctuation(tok.text) || line.tokenMeta[tokenIdx]?.isName)
-      return;
+    if (!tok) return;
+
+    if (isPunctuation(tok.text) || line.tokenMeta?.[tokenIdx]?.isName) return;
 
     const englishWord = tok.text;
-    // nur das Wort, kein Kontext
+    const lower = englishWord.toLowerCase();
     const payload = { phraseText: englishWord, wantAlternatives: true };
 
-    try {
-      const resp = await fetch(`${API_BASE}/api/translate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await resp.json();
-      // Server soll NICHT den Prompt zurückgeben, sondern das Ergebnis:
-      // { translatedText: "...", alts: ["...", "..."] }
-      let primary = String(data?.translatedText || "").trim();
-      let alts = Array.isArray(data?.alts) ? data.alts : [];
+    (async () => {
+      try {
+        // Parallel: DeepL + DB-Vorschläge
+        const dlReq = fetch(`${API_BASE}/api/lookup/single`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const dbReq = fetch(
+          `${API_BASE}/api/vocab/suggest?eng=${encodeURIComponent(
+            lower
+          )}&limit=25`
+        );
 
-      // bereinigen & deduplizieren
-      const cleaned = cleanCandidates([primary, ...alts]);
-      if (!cleaned.length) return;
+        const [dlRes, dbRes] = await Promise.allSettled([dlReq, dbReq]);
 
-      primary = cleaned[0];
-      const rest = cleaned.slice(1);
+        let primary = "";
+        let alts = [];
 
-      // State mergen & aktiv setzen
-      setLines((prev) => {
-        const up = [...prev];
-        const ln = { ...up[lineIdx] };
-        const tr = [...ln.translations];
-        const cf = [...ln.confirmed];
-        const opts = ln.translationOptions.map((a) => (a ? [...a] : []));
+        if (dlRes.status === "fulfilled" && dlRes.value.ok) {
+          const j = await dlRes.value.json();
+          primary = (j?.primary || "").trim();
+          alts = cleanCandidates(j?.alternatives || []);
+        }
 
-        // existierende + neue Optionen deduplizieren (Case-insensitiv)
-        const merged = [...opts[tokenIdx], primary, ...rest];
+        let dbOptions = [];
+        if (dbRes.status === "fulfilled" && dbRes.value.ok) {
+          const j2 = await dbRes.value.json();
+          dbOptions = Array.isArray(j2?.options)
+            ? j2.options
+                .map((o) => (o?.ger || "").trim())
+                .filter(Boolean)
+            : [];
+        }
+
+        // Merge: DB zuerst, dann DeepL
+        const merged = [...dbOptions, primary, ...alts];
+
+        // Dedupe (case-insensitiv)
         const seen = new Set();
         const dedup = merged.filter((o) => {
           const k = (o || "").toLowerCase().trim();
@@ -252,33 +238,57 @@ and to learn some words and culture in the process.`
           return true;
         });
 
-        tr[tokenIdx] = primary;
-        cf[tokenIdx] = true;
-        opts[tokenIdx] = dedup;
+        // Kopf (DB sortiert vom Server), Rest mit local priority sortieren
+        const dbCount = dbOptions.length;
+        const head = dedup.slice(0, dbCount);
+        const tail = dedup.slice(dbCount);
+        const tailSorted = sortWithPriority(priorityState, lower, tail);
+        const finalOptions = [...head, ...tailSorted];
 
-        ln.translations = tr;
-        ln.confirmed = cf;
-        ln.translationOptions = opts;
-        up[lineIdx] = ln;
-        return up;
-      });
+        setLines((prev) => {
+          const copy = [...prev];
+          const L = { ...copy[lineIdx] };
+          const opts = [...(L.translationOptions || [])];
+          const tr = [...(L.translations || [])];
+          const cf = [...(L.confirmed || [])];
 
-      // Optional: sofort speichern (falls Endpoint existiert)
-      try {
-        await fetch(`${API_BASE}/api/vocab/save`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ eng: englishWord.toLowerCase(), ger: primary }),
+          opts[tokenIdx] = finalOptions;
+
+          // Falls noch nichts gewählt: erste Option übernehmen
+          if (!cf[tokenIdx] && finalOptions.length > 0) {
+            tr[tokenIdx] = finalOptions[0];
+            cf[tokenIdx] = true;
+          }
+
+          L.translationOptions = opts;
+          L.translations = tr;
+          L.confirmed = cf;
+          copy[lineIdx] = L;
+          return copy;
         });
-      } catch {
-        /* still */
+
+        // primary als "Hint" in DB speichern (optional)
+        if (primary) {
+          try {
+            fetch(`${API_BASE}/api/vocab/save`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                eng: lower,
+                ger: primary,
+              }),
+            });
+          } catch {
+            /* ignore */
+          }
+        }
+      } catch (e) {
+        console.warn("DeepL single-word / DB failed:", e);
       }
-    } catch (e) {
-      console.warn("DeepL single-word failed:", e);
-    }
+    })();
   }
 
-  /* ---------------- Tooltip-Logik (defensiv) ---------------- */
+  /* ---------------- Tooltip-Logik ---------------- */
 
   function scheduleHide() {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
@@ -287,31 +297,29 @@ and to learn some words and culture in the process.`
       200
     );
   }
+
   function cancelHide() {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
     hoverTimerRef.current = null;
   }
-  const onEnter = (li, ti) => {
+
+  const onEnterToken = (li, ti) => {
     cancelHide();
     setHoverInfo({ lineIdx: li, tokenIdx: ti, overTooltip: false });
   };
-  const onLeave = () => {
-    if (!hoverInfo.overTooltip) scheduleHide();
-  };
-  const tipEnter = () => {
-    cancelHide();
-    setHoverInfo((p) => ({ ...p, overTooltip: true }));
-  };
-  const tipLeave = () => scheduleHide();
 
-  function safeGetTokenEl(lineIdx, tokenIdx) {
-    const key = `${lineIdx}-${tokenIdx}`;
-    const el = tokenRefs.current[key];
-    if (!el) return null;
-    if (!document.body.contains(el)) return null;
-    if (typeof el.getBoundingClientRect !== "function") return null;
-    return el;
-  }
+  const onLeaveToken = () => {
+    scheduleHide();
+  };
+
+  const onEnterTooltip = () => {
+    cancelHide();
+    setHoverInfo((h) => ({ ...h, overTooltip: true }));
+  };
+
+  const onLeaveTooltip = () => {
+    scheduleHide();
+  };
 
   function renderTooltip() {
     const { lineIdx, tokenIdx } = hoverInfo;
@@ -330,150 +338,96 @@ and to learn some words and culture in the process.`
 
     const el = safeGetTokenEl(lineIdx, tokenIdx);
     if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const scrollX =
+      window.scrollX != null ? window.scrollX : document.documentElement.scrollLeft || 0;
+    const scrollY =
+      window.scrollY != null ? window.scrollY : document.documentElement.scrollTop || 0;
 
-    let rect;
-    try {
-      rect = el.getBoundingClientRect();
-    } catch {
-      return null;
-    }
-    const left = (rect?.left || 0) + window.scrollX;
-    const top = (rect?.bottom || 0) + window.scrollY + 4;
+    const left = rect.left + scrollX;
+    const top = rect.bottom + scrollY + 4;
 
-    const w = line.tokens[tokenIdx]?.text || "";
-    const lower = w.toLowerCase();
-    const fromState = Array.isArray(line.translationOptions?.[tokenIdx])
-      ? line.translationOptions[tokenIdx]
-      : [];
-    const fromFile = Array.isArray(vocabMap[lower]) ? vocabMap[lower] : [];
-    const current = line.translations?.[tokenIdx] || "";
+    const options =
+      line.translationOptions?.[tokenIdx]?.filter(Boolean) || [];
 
-    let merged = [];
-    if (current) merged.push(current);
-    merged = merged.concat(fromState, fromFile);
-
-    // Manuelle Eingabe ans Ende anhängen
-    merged = merged.filter(Boolean);
-    const seen = new Set();
-    merged = merged.filter((o) => {
-      const k = String(o).trim().toLowerCase();
-      if (!k) return false;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    });
-
-    merged.push("➕ Manuelle Eingabe …");
-
-    const tip = {
+    const tooltipStyle = {
       position: "absolute",
       left,
       top,
-      zIndex: 9999,
       background: "#fff7d6",
       border: "1px solid #eab308",
-      borderRadius: "8px",
-      boxShadow: "0 10px 20px rgba(0,0,0,.15)",
+      borderRadius: 8,
+      boxShadow: "0 10px 20px rgba(15,23,42,0.25)",
       padding: "8px 10px",
+      zIndex: 9999,
+      minWidth: 120,
+      maxWidth: 260,
       fontSize: 14,
-      color: "#1f2937",
-      minWidth: 160,
-      maxWidth: 360,
-      maxHeight: 300,
-      overflowY: "auto",
     };
-    const item = {
+
+    const optionStyle = {
       cursor: "pointer",
-      padding: "4px 6px",
-      borderRadius: 6,
-      lineHeight: 1.4,
+      padding: "3px 6px",
+      borderRadius: 4,
+      marginBottom: 2,
       fontWeight: 500,
+      lineHeight: 1.3,
     };
 
     const pick = (choice) => {
       if (!choice) return;
-      if (choice === "➕ Manuelle Eingabe …") {
-        const val = window.prompt("Eigene Übersetzung eingeben:");
-        const cleaned = (val || "").trim();
-        if (!cleaned) return;
-        applyChoice(cleaned);
-        // Optional speichern
-        try {
-          fetch(`${API_BASE}/api/vocab/save`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              eng: w.toLowerCase(),
-              ger: cleaned,
-            }),
-          });
-        } catch {
-          /* noop */
-        }
-        return;
-      }
-      applyChoice(choice);
+      const tok = line.tokens[tokenIdx];
+      const lower = tok.text.toLowerCase();
+
+      // Priority lokal
+      const newState = updatePriority(priorityState, lower, choice);
+      setPriorityState(newState);
+
+      // Priority in DB / cnt
       try {
         fetch(`${API_BASE}/api/vocab/save`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            eng: w.toLowerCase(),
-            ger: choice,
-          }),
+          body: JSON.stringify({ eng: lower, ger: choice }),
         });
       } catch {
         /* noop */
       }
-    };
 
-    const applyChoice = (choice) => {
       setLines((prev) => {
-        const up = [...prev];
-        const L = { ...up[lineIdx] };
-        const tr = [...L.translations];
-        const cf = [...L.confirmed];
-        const opts = L.translationOptions.map((a) => (a ? [...a] : []));
-
+        const copy = [...prev];
+        const L = { ...copy[lineIdx] };
+        const tr = [...(L.translations || [])];
+        const cf = [...(L.confirmed || [])];
         tr[tokenIdx] = choice;
         cf[tokenIdx] = true;
-        // gewählte zuerst
-        const rest = (opts[tokenIdx] || []).filter(
-          (o) => String(o).trim().toLowerCase() !== choice.trim().toLowerCase()
-        );
-        opts[tokenIdx] = [choice, ...rest];
-
         L.translations = tr;
         L.confirmed = cf;
-        L.translationOptions = opts;
-        up[lineIdx] = L;
-        return up;
+        copy[lineIdx] = L;
+        return copy;
       });
+
       setHoverInfo({ lineIdx: null, tokenIdx: null, overTooltip: false });
     };
 
+    if (!options.length) return null;
+
     return (
-      <div style={tip} onMouseEnter={tipEnter} onMouseLeave={tipLeave}>
-        <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 6 }}>
-          Mouseover für Optionen &nbsp;/&nbsp; <b>Klick</b> auf EN-Wort =
-          DeepL-Lookup (ohne Kontext)
-        </div>
-        {merged.map((choice, i) => (
+      <div
+        style={tooltipStyle}
+        onMouseEnter={onEnterTooltip}
+        onMouseLeave={onLeaveTooltip}
+      >
+        {options.map((opt, idx) => (
           <div
-            key={i}
-            style={item}
+            key={idx}
+            style={optionStyle}
             onMouseDown={(e) => {
               e.preventDefault();
-              pick(choice);
-            }}
-            onMouseOver={(e) => {
-              e.currentTarget.style.background = "#fde68a";
-            }}
-            onMouseOut={(e) => {
-              e.currentTarget.style.background = "transparent";
+              pick(opt);
             }}
           >
-            {choice}
+            {opt}
           </div>
         ))}
       </div>
@@ -487,54 +441,25 @@ and to learn some words and culture in the process.`
     background: "#f6f7fb",
     color: "#0f172a",
     padding: 20,
-    paddingBottom: 150, // Abstand unten
+    paddingBottom: 150,
   };
   const wrap = { maxWidth: 1000, margin: "0 auto" };
   const card = {
     background: "#fff",
     borderRadius: 16,
-    boxShadow: "0 6px 18px rgba(0,0,0,.06)",
-    padding: 16,
+    padding: 20,
+    boxShadow: "0 12px 30px rgba(15,23,42,0.12)",
+    marginBottom: 20,
   };
-  const badge = (selected) => ({
-    display: "inline-block",
-    padding: "2px 8px",
-    borderRadius: 12,
-    border: "1px solid #d1d5db",
-    background: selected ? "#fef3c7" : "#f3f4f6",
-    marginTop: 6,
-    fontSize: selected ? 18 : 14,
-    fontWeight: selected ? 700 : 400,
-  });
-  const eng = (isName) => ({
-    display: "inline-block",
-    padding: "2px 8px",
-    borderRadius: 12,
-    border: `1px solid ${isName ? "#93c5fd" : "transparent"}`,
-    background: isName ? "#dbeafe" : "transparent",
-    fontSize: 20,
-    fontWeight: 600,
-    cursor: "pointer",
-  });
+  const h1 = { fontSize: 26, marginBottom: 10 };
+  const h2 = { fontSize: 18, margin: "16px 0 8px" };
 
   return (
     <div style={page}>
       <div style={wrap}>
-        <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 8 }}>
-          Birkenbihllab Trainer (EN → DE)
-        </h1>
-        <p style={{ color: "#475569", marginBottom: 16 }}>
-          Text einfügen → <b>Aufbereiten</b> → Mouseover zeigt Optionen;{" "}
-          <b>Klick</b> auf ein englisches Wort holt DeepL-Alternativen{" "}
-          <i>ohne Kontext</i> (1–3 Wörter).
-          <br />
-          API: <code>{API_BASE || "(same origin)"}</code>
-        </p>
-
         <div style={card}>
-          <label style={{ fontSize: 14, fontWeight: 600 }}>
-            Englischer Text (jede Zeile wird separat gelernt):
-          </label>
+          <h1 style={h1}>Birkenbihllab Trainer (EN → DE)</h1>
+          <label style={{ fontWeight: 500 }}>Englischer Input-Text</label>
           <textarea
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
@@ -543,120 +468,127 @@ and to learn some words and culture in the process.`
               minHeight: 120,
               marginTop: 8,
               padding: 10,
-              borderRadius: 12,
-              border: "1px solid #cbd5e1",
-              background: "#f8fafc",
-              fontFamily:
-                "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-              fontSize: 13,
+              borderRadius: 8,
+              border: "1px solid #cbd5f5",
+              fontFamily: "monospace",
+              fontSize: 14,
             }}
           />
-          <div
-            style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 }}
-          >
+
+          <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
             <button
-              disabled={!vocabLoaded}
               onClick={handlePrepare}
               style={{
-                background: vocabLoaded ? "#2563eb" : "#9bb7ff",
-                color: "white",
-                border: 0,
-                padding: "8px 12px",
-                borderRadius: 12,
-                fontWeight: 700,
-                cursor: vocabLoaded ? "pointer" : "not-allowed",
-              }}
-            >
-              {vocabLoaded ? "Aufbereiten" : "Vokabeln laden …"}
-            </button>
-            <button
-              disabled={isTranslatingFull}
-              onClick={handleFullTextTranslate}
-              style={{
-                background: "#16a34a",
-                color: "white",
-                border: 0,
-                padding: "8px 12px",
-                borderRadius: 12,
-                fontWeight: 700,
+                padding: "6px 14px",
+                borderRadius: 999,
+                border: "none",
+                background: "#3b82f6",
+                color: "#fff",
+                fontWeight: 600,
                 cursor: "pointer",
               }}
             >
-              {isTranslatingFull ? "Übersetze…" : "Gesamten Text auf Deutsch"}
+              Zeilen vorbereiten
+            </button>
+            <button
+              onClick={handleFullTextTranslate}
+              disabled={isTranslatingFull}
+              style={{
+                padding: "6px 14px",
+                borderRadius: 999,
+                border: "none",
+                background: "#0ea5e9",
+                color: "#fff",
+                fontWeight: 600,
+                cursor: "pointer",
+                opacity: isTranslatingFull ? 0.7 : 1,
+              }}
+            >
+              {isTranslatingFull ? "Übersetze…" : "Volltext übersetzen"}
             </button>
           </div>
-
-          {fullGermanText && (
-            <div style={{ ...card, marginTop: 12, border: "1px solid #e5e7eb" }}>
-              <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>
-                Vollständige Kontext-Übersetzung (DeepL):
-              </div>
-              <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
-                {fullGermanText}
-              </div>
-            </div>
-          )}
         </div>
 
-        <div style={{ marginTop: 16, display: "grid", gap: 16 }}>
-          {lines.length === 0 ? (
-            <div style={{ color: "#64748b", fontStyle: "italic" }}>
-              (Noch nichts aufbereitet)
+        <div style={card}>
+          <h2 style={h2}>Zeilen & Tokens</h2>
+          {lines.length === 0 && (
+            <div style={{ color: "#64748b", fontSize: 14 }}>
+              Klicke oben auf <b>„Zeilen vorbereiten“</b>, um zu starten.
             </div>
-          ) : (
-            lines.map((line, li) => (
-              <div key={li} style={card}>
-                <div
-                  style={{
-                    display: "flex",
-                    flexWrap: "wrap",
-                    columnGap: 16,
-                    rowGap: 20,
-                    alignItems: "flex-start",
-                  }}
-                >
-                  {line.tokens.map((tok, ti) => {
-                    const refKey = `${li}-${ti}`;
-                    const tr = line.translations?.[ti];
-                    const isConfirmed = !!line.confirmed?.[ti];
-                    const meta = line.tokenMeta?.[ti] || {};
-                    const isName = !!meta.isName;
-                    const isPunctTok = !!meta.isPunct;
-
-                    return (
-                      <div
-                        key={ti}
-                        style={{
-                          display: "flex",
-                          flexDirection: "column",
-                          alignItems: "flex-start",
-                          minWidth: "max-content",
-                        }}
-                      >
-                        <span
-                          ref={(el) => (tokenRefs.current[refKey] = el)}
-                          style={eng(isName)}
-                          onMouseEnter={() => !isPunctTok && onEnter(li, ti)}
-                          onMouseLeave={onLeave}
-                          onClick={() => !isPunctTok && handleTokenClick(li, ti)}
-                          title={
-                            isPunctTok
-                              ? ""
-                              : "Mouseover = Optionen / Klick = DeepL-Alternativen"
-                          }
-                        >
-                          {tok.text}
-                        </span>
-                        <span style={badge(isConfirmed)}>
-                          {isPunctTok ? tok.text : tr?.trim() || "_"}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            ))
           )}
+          {lines.length > 0 &&
+            lines.map((line, li) => (
+              <div
+                key={li}
+                style={{
+                  padding: "6px 0",
+                  borderBottom: "1px dashed #e2e8f0",
+                  fontSize: 15,
+                }}
+              >
+                {line.tokens.map((tok, ti) => {
+                  const isPunct = line.tokenMeta?.[ti]?.isPunct;
+                  const isConfirmed = !!line.confirmed?.[ti];
+                  const ger = line.translations?.[ti] || "";
+                  const color = isPunct
+                    ? "#0f172a"
+                    : isConfirmed
+                    ? "#0f172a"
+                    : "#64748b";
+
+                  const wrapperStyle = {
+                    display: "inline-block",
+                    marginRight: isPunct ? 2 : 4,
+                    cursor: isPunct ? "default" : "pointer",
+                    padding: isPunct ? "0 0" : "0 2px",
+                    borderRadius: 4,
+                    background: isConfirmed ? "rgba(34,197,94,0.08)" : "none",
+                  };
+
+                  return (
+                    <span
+                      key={ti}
+                      ref={(el) => registerTokenRef(li, ti, el)}
+                      onMouseEnter={() => onEnterToken(li, ti)}
+                      onMouseLeave={onLeaveToken}
+                      onClick={() => handleTokenClick(li, ti)}
+                      style={wrapperStyle}
+                    >
+                      <div style={{ color }}>{tok.text}</div>
+                      {!isPunct && ger && (
+                        <div
+                          style={{
+                            fontSize: 12,
+                            color: "#16a34a",
+                            lineHeight: 1.1,
+                          }}
+                        >
+                          {ger}
+                        </div>
+                      )}
+                    </span>
+                  );
+                })}
+              </div>
+            ))}
+        </div>
+
+        <div style={card}>
+          <h2 style={h2}>Volltext-Übersetzung</h2>
+          <textarea
+            value={fullGermanText}
+            readOnly
+            style={{
+              width: "100%",
+              minHeight: 120,
+              marginTop: 8,
+              padding: 10,
+              borderRadius: 8,
+              border: "1px solid #cbd5f5",
+              fontFamily: "monospace",
+              fontSize: 14,
+            }}
+          />
         </div>
       </div>
 
