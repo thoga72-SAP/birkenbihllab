@@ -49,10 +49,7 @@ async function deeplTranslate(text, opts = {}) {
 app.post('/api/translate', async (req, res) => {
   try {
     const phraseText = (req.body?.phraseText || '').toString();
-    const contextText = (req.body?.contextText || '').toString();
 
-    // Für Wort-Lookup KEINE Zusatz-Prompting-Strings zurückgeben.
-    // Wir schicken nur die Phrase (optional könnte man contextText ignorieren)
     const j = await deeplTranslate(phraseText);
     const out = j?.translations?.[0]?.text || '';
     res.json({ translatedText: out });
@@ -75,9 +72,9 @@ app.post('/api/translate/fulltext', async (req, res) => {
 });
 
 // ---------- Vocab API ----------
-// WICHTIG: In Postgres brauchst du einen Unique-Constraint für (eng, ger):
+// Tabelle: vocab(eng text, ger text, priority int, cnt int)
+// PRIMARY KEY (eng, ger)
 //   ALTER TABLE public.vocab ADD CONSTRAINT vocab_pk PRIMARY KEY (eng, ger);
-// Spalten: eng text, ger text, priority int NOT NULL DEFAULT 0, cnt int NOT NULL DEFAULT 0
 
 // Upsert + Priorität hochzählen
 app.post('/api/vocab/save', async (req, res) => {
@@ -104,7 +101,6 @@ app.post('/api/vocab/save', async (req, res) => {
     res.json({ ok: true, row: rows[0] });
   } catch (e) {
     console.error('/api/vocab/save error:', e);
-    // Häufige Ursache: fehlender UNIQUE/PK auf (eng,ger)
     res.status(500).json({ error: 'save failed', detail: e.message });
   }
 });
@@ -128,6 +124,29 @@ app.get('/api/vocab/options', async (req, res) => {
   } catch (e) {
     console.error('/api/vocab/options error:', e);
     res.status(500).json({ error: 'options failed' });
+  }
+});
+
+// ---------- /api/vocab/suggest (gleich wie /options) ----------
+app.get('/api/vocab/suggest', async (req, res) => {
+  try {
+    if (!pool) return res.status(500).json({ error: 'DB not configured' });
+    const eng = (req.query.eng || '').toString().trim().toLowerCase();
+    if (!eng) return res.status(400).json({ error: 'eng required' });
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '25', 10), 1), 100);
+    const sql = `
+      SELECT ger, priority, cnt
+      FROM vocab
+      WHERE eng = $1
+      ORDER BY priority DESC, cnt DESC, LOWER(ger) ASC
+      LIMIT $2
+    `;
+    const { rows } = await pool.query(sql, [eng, limit]);
+    res.json({ options: rows });
+  } catch (e) {
+    console.error('/api/vocab/suggest error:', e);
+    res.status(500).json({ error: 'suggest failed' });
   }
 });
 
